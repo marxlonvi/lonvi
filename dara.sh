@@ -86,6 +86,7 @@ fi
 echo
 echo -e "${Y}Tekan Ctrl+C untuk keluar monitor.${W}"
 sleep 3
+done
 }
 
 start_monitor() {
