@@ -1,7 +1,7 @@
 #!/data/data/com.termux/files/usr/bin/bash
 
 VERSION="1.0.0"
-GITHUB="https://raw.githubusercontent.com/marxlonvi/lonvi/main/dara.sh"
+GITHUB="https://raw.githubusercontent.com/marxlonvi/lonvi/main"
 
 # ===== Auto Update =====
 check_update() {
