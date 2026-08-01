@@ -53,7 +53,7 @@ queue_count() {
 
 view_queue() {
     clear
-    echo "===== DAFTAR ROBLOX (ANTRIAN REJOIN) ====="
+    echo "===== DAFTAR ROBLOX (ANTRIAN LAUNCHER ROBLOX) ====="
     if [ ! -s "$QUEUEFILE" ]; then
         echo "(kosong)"
     else
@@ -148,6 +148,17 @@ manage_queue() {
 
 launch_package() {
     local pkg="$1"
+
+    if [ -n "$PSLINK" ]; then
+        # Arahkan link PS langsung ke package clone ini (-p), supaya Android
+        # tidak menampilkan dialog "buka dengan aplikasi apa" dan langsung
+        # masuk ke clone Roblox yang bersangkutan.
+        am start -a android.intent.action.VIEW -d "$PSLINK" -p "$pkg" >/dev/null 2>&1 \
+            && return
+    fi
+
+    # Fallback: kalau tidak ada PS link atau intent di atas gagal,
+    # buka app-nya biasa lewat launcher.
     am start -n "$(cmd package resolve-activity --brief "$pkg" 2>/dev/null | tail -n 1)" >/dev/null 2>&1 \
         || monkey -p "$pkg" -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1
 }
@@ -160,8 +171,8 @@ close_all_roblox() {
     fi
 
     if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
-        echo "Auto-rejoin sedang aktif, dimatikan dulu supaya tidak langsung buka ulang..."
-        stop_rejoin
+        echo "Auto-Launcher Roblox sedang aktif, dimatikan dulu supaya tidak langsung buka ulang..."
+        stop_launcher
     fi
 
     while IFS='|' read -r pkg delay; do
@@ -173,12 +184,10 @@ close_all_roblox() {
     sleep 2
 }
 
-# Jalankan urutan lengkap: buka PS link, delay 3 detik tetap,
-# lalu buka tiap Roblox di antrian dengan delay sesuai input masing-masing.
+# Jalankan urutan lengkap: delay 3 detik tetap, lalu buka PS link di
+# tiap Roblox clone secara langsung (targeted intent per package) dengan
+# delay sesuai input masing-masing.
 launch_sequence() {
-    if [ -n "$PSLINK" ]; then
-        termux-open-url "$PSLINK"
-    fi
     sleep 3
 
     if [ ! -s "$QUEUEFILE" ]; then
@@ -193,13 +202,13 @@ launch_sequence() {
     done < "$QUEUEFILE"
 }
 
-# Background auto-rejoin loop: does NOT touch the terminal (no clear/echo
+# Background auto-launcher roblox loop: does NOT touch the terminal (no clear/echo
 # to stdout), so it no longer fights with the interactive menu for screen
 # control. It checks every few seconds whether each Roblox app in the
 # antrian is still running; if any has closed/crashed, it replays the
 # whole open sequence (PS link -> delay 3s -> roblox1 -> delay input ->
 # roblox2 -> delay input -> dst) to bring everything back up.
-rejoin_loop() {
+launcher_loop() {
     while true; do
         need_relaunch=0
 
@@ -216,8 +225,8 @@ rejoin_loop() {
         if [ "$need_relaunch" -eq 1 ]; then
             if command -v termux-notification >/dev/null 2>&1; then
                 termux-notification \
-                    --id dara_rejoin \
-                    --title "DARA Auto-Rejoin" \
+                    --id dara_launcher \
+                    --title "DARA Auto-Launcher" \
                     --content "Ada Roblox yang tertutup, menjalankan ulang antrian..."
             fi
 
@@ -228,7 +237,7 @@ rejoin_loop() {
     done
 }
 
-start_rejoin() {
+start_launcher() {
     if [ ! -s "$QUEUEFILE" ]; then
         echo "Antrian Roblox masih kosong. Tambahkan lewat menu 2."
         sleep 2
@@ -236,7 +245,7 @@ start_rejoin() {
     fi
 
     if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
-        echo "Auto-rejoin sudah berjalan."
+        echo "Auto-Launcher Roblox sudah berjalan."
         sleep 2
         return
     fi
@@ -245,25 +254,25 @@ start_rejoin() {
         QUEUEFILE='$QUEUEFILE'; PSLINK='$PSLINK'
         $(declare -f launch_package)
         $(declare -f launch_sequence)
-        $(declare -f rejoin_loop)
-        rejoin_loop
+        $(declare -f launcher_loop)
+        launcher_loop
     " >/dev/null 2>&1 &
     echo $! > "$PIDFILE"
 
-    echo "Auto-rejoin dimulai di background."
+    echo "Auto-Launcher Roblox dimulai di background."
     sleep 2
 }
 
-stop_rejoin() {
+stop_launcher() {
     if [ -f "$PIDFILE" ]; then
         kill "$(cat "$PIDFILE")" 2>/dev/null
         rm -f "$PIDFILE"
         if command -v termux-notification-remove >/dev/null 2>&1; then
-            termux-notification-remove dara_rejoin
+            termux-notification-remove dara_launcher
         fi
-        echo "Auto-rejoin dihentikan."
+        echo "Auto-Launcher Roblox dihentikan."
     else
-        echo "Auto-rejoin tidak berjalan."
+        echo "Auto-Launcher Roblox tidak berjalan."
     fi
 
     sleep 2
@@ -379,18 +388,18 @@ fi
 
 while true; do
     clear
-echo -e "${Y}╔════════════════════════════╗${W}"
-echo -e "${Y}║${C}         DARA v$VERSION        ${Y}║${W}"
-echo -e "${Y}╠════════════════════════════╣${W}"
-echo -e "${Y}║${W} 1. Masukkan Link PS        ${Y}║${W}"
-echo -e "${Y}║${W} 2. Kelola Antrian Roblox   ${Y}║${W}"
-echo -e "${Y}║${W} 3. Buka Semua (Sequence)   ${Y}║${W}"
-echo -e "${Y}║${W} 4. Start Rejoin            ${Y}║${W}"
-echo -e "${Y}║${W} 5. Stop Rejoin             ${Y}║${W}"
-echo -e "${Y}║${W} 6. Close All Roblox        ${Y}║${W}"
-echo -e "${Y}║${W} 7. Auto Clear Cache        ${Y}║${W}"
-echo -e "${Y}║${W} 0. Keluar                  ${Y}║${W}"
-echo -e "${Y}╚════════════════════════════╝${W}"
+echo -e "${Y}╔══════════════════════════╗${W}"
+echo -e "${Y}║${C}       DARA v$VERSION        ${Y}║${W}"
+echo -e "${Y}╠══════════════════════════╣${W}"
+echo -e "${Y}║${W} 1. Masukkan Link PS      ${Y}║${W}"
+echo -e "${Y}║${W} 2. Kelola Antrian Roblox ${Y}║${W}"
+echo -e "${Y}║${W} 3. Buka Semua (Sequence) ${Y}║${W}"
+echo -e "${Y}║${W} 4. Start Launcher Roblox ${Y}║${W}"
+echo -e "${Y}║${W} 5. Stop Launcher Roblox  ${Y}║${W}"
+echo -e "${Y}║${W} 6. Close All Roblox      ${Y}║${W}"
+echo -e "${Y}║${W} 7. Auto Clear Cache      ${Y}║${W}"
+echo -e "${Y}║${W} 0. Keluar                ${Y}║${W}"
+echo -e "${Y}╚══════════════════════════╝${W}"
 echo
 
 echo -e "${C}Link PS   :${W} ${PSLINK:-Belum diatur}"
@@ -408,9 +417,9 @@ if [ -s "$QUEUEFILE" ]; then
 fi
 
 if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
-    echo -e "${C}Rejoin    :${W} ${G}● AKTIF${W}"
+    echo -e "${C}Launcher   :${W} ${G}● AKTIF${W}"
 else
-    echo -e "${C}Rejoin    :${W} ${R}● TIDAK AKTIF${W}"
+    echo -e "${C}Launcher   :${W} ${R}● TIDAK AKTIF${W}"
 fi
 
 if [ -f "$CACHE_PIDFILE" ] && kill -0 "$(cat "$CACHE_PIDFILE")" 2>/dev/null; then
@@ -439,11 +448,11 @@ echo
             ;;
 
         4)
-            start_rejoin
+            start_launcher
             ;;
 
         5)
-            stop_rejoin
+            stop_launcher
             ;;
 
         6)
@@ -455,7 +464,7 @@ echo
             ;;
 
         0)
-            stop_rejoin
+            stop_launcher
             exit
             ;;
 
