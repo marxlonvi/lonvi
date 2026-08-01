@@ -152,6 +152,27 @@ launch_package() {
         || monkey -p "$pkg" -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1
 }
 
+close_all_roblox() {
+    if [ ! -s "$QUEUEFILE" ]; then
+        echo "Antrian Roblox masih kosong."
+        sleep 2
+        return
+    fi
+
+    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+        echo "Auto-rejoin sedang aktif, dimatikan dulu supaya tidak langsung buka ulang..."
+        stop_rejoin
+    fi
+
+    while IFS='|' read -r pkg delay; do
+        [ -z "$pkg" ] && continue
+        am force-stop "$pkg" >/dev/null 2>&1
+    done < "$QUEUEFILE"
+
+    echo "Semua Roblox di antrian sudah ditutup."
+    sleep 2
+}
+
 # Jalankan urutan lengkap: buka PS link, delay 3 detik tetap,
 # lalu buka tiap Roblox di antrian dengan delay sesuai input masing-masing.
 launch_sequence() {
@@ -366,7 +387,8 @@ echo -e "${Y}║${W} 2. Kelola Antrian Roblox   ${Y}║${W}"
 echo -e "${Y}║${W} 3. Buka Semua (Sequence)   ${Y}║${W}"
 echo -e "${Y}║${W} 4. Start Rejoin            ${Y}║${W}"
 echo -e "${Y}║${W} 5. Stop Rejoin             ${Y}║${W}"
-echo -e "${Y}║${W} 6. Auto Clear Cache        ${Y}║${W}"
+echo -e "${Y}║${W} 6. Close All Roblox        ${Y}║${W}"
+echo -e "${Y}║${W} 7. Auto Clear Cache        ${Y}║${W}"
 echo -e "${Y}║${W} 0. Keluar                  ${Y}║${W}"
 echo -e "${Y}╚════════════════════════════╝${W}"
 echo
@@ -425,6 +447,10 @@ echo
             ;;
 
         6)
+            close_all_roblox
+            ;;
+
+        7)
             toggle_cache_clear
             ;;
 
