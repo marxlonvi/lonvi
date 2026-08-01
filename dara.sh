@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 
-VERSION="1.0.0"
+VERSION="1.0.1"
 GITHUB="https://raw.githubusercontent.com/marxlonvi/lonvi/main"
 
 CONFIG="$HOME/.dara"
