@@ -3,45 +3,22 @@
 VERSION="1.0.0"
 GITHUB="https://raw.githubusercontent.com/marxlonvi/lonvi/main"
 
-# ===== Auto Update =====
+CONFIG="$HOME/.dara"
+PACKAGE="com.roblox.client"
+
 check_update() {
-    if ! command -v curl >/dev/null 2>&1; then
-        pkg install -y curl >/dev/null 2>&1
-    fi
+    remote=$(curl -fsSL "$GITHUB/version.txt" 2>/dev/null)
 
-    REMOTE=$(curl -fsSL "$GITHUB/version.txt" 2>/dev/null)
-
-    if [ -n "$REMOTE" ] && [ "$REMOTE" != "$VERSION" ]; then
-        clear
-        echo "=================================="
-        echo "        VIDAR UPDATER"
-        echo "=================================="
-        echo "Versi Baru : $REMOTE"
-        echo "Mengupdate..."
-
-        curl -fsSL "$GITHUB/vidar.sh" -o "$0"
+    if [ -n "$remote" ] && [ "$remote" != "$VERSION" ]; then
+        echo "[INFO] Update tersedia ($remote)"
+        curl -fsSL "$GITHUB/dara.sh" -o "$0"
         chmod +x "$0"
-
-        echo "Update berhasil!"
-        sleep 2
+        echo "[INFO] Restart..."
         exec "$0"
     fi
 }
 
 check_update
-
-# ===== Root =====
-su -c "true" >/dev/null 2>&1 || {
-    echo "Root tidak tersedia!"
-    exit 1
-}
-
-ROOT() {
-    su -c "$*"
-}
-
-CONFIG="$HOME/.vidar.conf"
-PKG="com.roblox.client"
 
 [ -f "$CONFIG" ] && source "$CONFIG"
 
@@ -51,65 +28,68 @@ PSLINK="$PSLINK"
 EOF
 }
 
-while true
-do
-clear
-echo "=================================="
-echo "            V I D A R"
-echo "=================================="
-echo "1. Masukkan Private Server"
-echo "2. Buka Roblox"
-echo "3. Force Close Roblox"
-echo "4. Clear Cache"
-echo "5. Rejoin"
-echo "0. Exit"
-echo "=================================="
+monitor() {
+    while true; do
+        clear
+        echo "========== DARA =========="
+        echo
 
-read -p "Pilih : " menu
+        if pidof "$PACKAGE" >/dev/null; then
+            echo "Status : RUNNING"
+        else
+            echo "Status : CRASH/DC"
+            echo "Rejoin dalam 5 detik..."
 
-case "$menu" in
+            sleep 5
 
-1)
-read -p "Link Private Server : " PSLINK
-save_config
-echo "Berhasil disimpan."
-sleep 1
-;;
+            if [ -n "$PSLINK" ]; then
+                termux-open-url "$PSLINK"
+            fi
+        fi
 
-2)
-ROOT "am start -a android.intent.action.VIEW -d '$PSLINK'"
-;;
+        sleep 3
+    done
+}
 
-3)
-ROOT "am force-stop $PKG"
-echo "Selesai."
-sleep 1
-;;
+while true; do
+    clear
+    echo "========== DARA =========="
+    echo "1. Masukkan Private Server"
+    echo "2. Buka Roblox"
+    echo "3. Start Monitor"
+    echo "0. Keluar"
+    echo
 
-4)
-ROOT "pm clear $PKG"
-echo "Cache dibersihkan."
-sleep 2
-;;
+    read -p "Pilih: " menu
 
-5)
-ROOT "
-am force-stop $PKG
-sleep 2
-pm clear $PKG
-sleep 2
-am start -a android.intent.action.VIEW -d '$PSLINK'
-"
-;;
+    case "$menu" in
+        1)
+            read -p "Link PS: " PSLINK
+            save_config
+            echo "Private Server berhasil disimpan."
+            sleep 1
+            ;;
 
-0)
-exit
-;;
+        2)
+            if [ -n "$PSLINK" ]; then
+                termux-open-url "$PSLINK"
+            else
+                echo "Masukkan Link Private Server terlebih dahulu."
+                sleep 2
+            fi
+            ;;
 
-*)
-echo "Menu tidak tersedia."
-sleep 1
-;;
+        3)
+            monitor
+            ;;
 
-esac
+        0)
+            exit
+            ;;
+
+        *)
+            echo "Menu tidak tersedia."
+            sleep 1
+            ;;
+    esac
 done
