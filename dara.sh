@@ -74,53 +74,68 @@ choose_roblox() {
     read -p "Enter..."
 }
 
-# Background monitor: does NOT touch the terminal (no clear/echo to stdout),
-# so it no longer fights with the interactive menu for screen control.
-# Status is pushed via a Termux notification instead (requires termux-api).
-monitor_loop() {
+# Background auto-rejoin loop: does NOT touch the terminal (no clear/echo
+# to stdout), so it no longer fights with the interactive menu for screen
+# control. It checks every few seconds whether the Roblox package is still
+# running; if it has closed/crashed, it relaunches it via the PS link (or,
+# if no link is set, via the app's own launcher intent).
+rejoin_loop() {
     while true; do
-        if [ -n "$PACKAGE" ] && pidof "$PACKAGE" >/dev/null 2>&1; then
-            STATUS="RUNNING"
-        else
-            STATUS="NOT RUNNING"
+        if [ -n "$PACKAGE" ]; then
+            if ! pidof "$PACKAGE" >/dev/null 2>&1; then
+                if command -v termux-notification >/dev/null 2>&1; then
+                    termux-notification \
+                        --id dara_rejoin \
+                        --title "DARA Auto-Rejoin" \
+                        --content "$PACKAGE tidak berjalan, mencoba rejoin..."
+                fi
+
+                if [ -n "$PSLINK" ]; then
+                    termux-open-url "$PSLINK"
+                else
+                    am start -n "$(cmd package resolve-activity --brief "$PACKAGE" 2>/dev/null | tail -n 1)" >/dev/null 2>&1 \
+                        || monkey -p "$PACKAGE" -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1
+                fi
+
+                # beri waktu app untuk benar-benar terbuka sebelum cek lagi
+                sleep 15
+            fi
         fi
 
-        if command -v termux-notification >/dev/null 2>&1; then
-            termux-notification \
-                --id dara_monitor \
-                --title "DARA Monitor" \
-                --content "Package: ${PACKAGE:-Belum dipilih} | Status: $STATUS" \
-                --ongoing
-        fi
-
-        sleep 3
+        sleep 5
     done
 }
 
-start_monitor() {
-    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
-        echo "Monitor sudah berjalan."
+start_rejoin() {
+    if [ -z "$PACKAGE" ]; then
+        echo "Pilih Roblox terlebih dahulu (menu 2)."
         sleep 2
         return
     fi
 
-    nohup bash -c "$(declare -f monitor_loop); PACKAGE='$PACKAGE'; monitor_loop" >/dev/null 2>&1 &
+    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+        echo "Auto-rejoin sudah berjalan."
+        sleep 2
+        return
+    fi
+
+    nohup bash -c "$(declare -f rejoin_loop); PACKAGE='$PACKAGE'; PSLINK='$PSLINK'; rejoin_loop" >/dev/null 2>&1 &
     echo $! > "$PIDFILE"
 
-    echo "Monitor dimulai (berjalan di background, cek notifikasi)."
+    echo "Auto-rejoin dimulai di background."
     sleep 2
 }
 
-stop_monitor() {
+stop_rejoin() {
     if [ -f "$PIDFILE" ]; then
         kill "$(cat "$PIDFILE")" 2>/dev/null
         rm -f "$PIDFILE"
         if command -v termux-notification-remove >/dev/null 2>&1; then
-            termux-notification-remove dara_monitor
+            termux-notification-remove dara_rejoin
         fi
-        echo "Monitor dihentikan."
+        echo "Auto-rejoin dihentikan."
     else
-        echo "Monitor tidak berjalan."
+        echo "Auto-rejoin tidak berjalan."
     fi
 
     sleep 2
@@ -136,10 +151,29 @@ echo -e "${Y}╠═════════════════════�
 echo -e "${Y}║${W} 1. Masukkan Link PS        ${Y}║${W}"
 echo -e "${Y}║${W} 2. Pilih Roblox            ${Y}║${W}"
 echo -e "${Y}║${W} 3. Buka Roblox             ${Y}║${W}"
-echo -e "${Y}║${W} 4. Start Monitor           ${Y}║${W}"
-echo -e "${Y}║${W} 5. Stop Monitor            ${Y}║${W}"
+echo -e "${Y}║${W} 4. Start Rejoin            ${Y}║${W}"
+echo -e "${Y}║${W} 5. Stop Rejoin             ${Y}║${W}"
 echo -e "${Y}║${W} 0. Keluar                  ${Y}║${W}"
 echo -e "${Y}╚════════════════════════════╝${W}"
+echo
+
+echo -e "${C}Link PS   :${W} ${PSLINK:-Belum diatur}"
+echo -e "${C}Roblox    :${W} ${PACKAGE:-Belum dipilih}"
+
+if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+    echo -e "${C}Rejoin    :${W} ${G}● AKTIF${W}"
+else
+    echo -e "${C}Rejoin    :${W} ${R}● TIDAK AKTIF${W}"
+fi
+
+if [ -n "$PACKAGE" ]; then
+    if pidof "$PACKAGE" >/dev/null 2>&1; then
+        echo -e "${C}Status App:${W} ${G}● RUNNING${W}"
+    else
+        echo -e "${C}Status App:${W} ${R}● NOT RUNNING${W}"
+    fi
+fi
+
 echo
 
     read -p "Pilih: " menu
@@ -164,15 +198,15 @@ echo
             ;;
 
         4)
-            start_monitor
+            start_rejoin
             ;;
 
         5)
-            stop_monitor
+            stop_rejoin
             ;;
 
         0)
-            stop_monitor
+            stop_rejoin
             exit
             ;;
 
