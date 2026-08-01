@@ -20,9 +20,16 @@ check_update() {
 
     if [ -n "$remote" ] && [ "$remote" != "$VERSION" ]; then
         echo "Update tersedia: $remote"
-        curl -fsSL "$GITHUB/dara.sh" -o "$0"
-        chmod +x "$0"
-        exec "$0"
+        tmpfile=$(mktemp)
+        if curl -fsSL "$GITHUB/dara.sh" -o "$tmpfile"; then
+            chmod +x "$tmpfile"
+            mv "$tmpfile" "$0"
+            exec "$0"
+        else
+            echo "Gagal mengunduh update, melanjutkan dengan versi saat ini."
+            rm -f "$tmpfile"
+            sleep 2
+        fi
     fi
 }
 
@@ -54,7 +61,7 @@ choose_roblox() {
     echo
     read -p "Pilih nomor: " pilih
 
-    if [ "$pilih" -ge 1 ] 2>/dev/null && [ "$pilih" -le "${#APPS[@]}" ]; then
+    if [[ "$pilih" =~ ^[0-9]+$ ]] && [ "$pilih" -ge 1 ] && [ "$pilih" -le "${#APPS[@]}" ]; then
         PACKAGE="${APPS[$((pilih-1))]}"
         save_config
         echo
@@ -67,26 +74,27 @@ choose_roblox() {
     read -p "Enter..."
 }
 
+# Background monitor: does NOT touch the terminal (no clear/echo to stdout),
+# so it no longer fights with the interactive menu for screen control.
+# Status is pushed via a Termux notification instead (requires termux-api).
 monitor_loop() {
     while true; do
-        clear
-echo -e "${Y}╔════════════════════════════╗${W}"
-echo -e "${Y}║${C}      DARA MONITOR         ${Y}║${W}"
-echo -e "${Y}╚════════════════════════════╝${W}"
-echo
+        if [ -n "$PACKAGE" ] && pidof "$PACKAGE" >/dev/null 2>&1; then
+            STATUS="RUNNING"
+        else
+            STATUS="NOT RUNNING"
+        fi
 
-echo -e "${C}Package :${W} ${PACKAGE:-Belum dipilih}"
+        if command -v termux-notification >/dev/null 2>&1; then
+            termux-notification \
+                --id dara_monitor \
+                --title "DARA Monitor" \
+                --content "Package: ${PACKAGE:-Belum dipilih} | Status: $STATUS" \
+                --ongoing
+        fi
 
-if [ -n "$PACKAGE" ] && pidof "$PACKAGE" >/dev/null 2>&1; then
-    echo -e "${G}● RUNNING${W}"
-else
-    echo -e "${R}● NOT RUNNING${W}"
-fi
-
-echo
-echo -e "${Y}Tekan Ctrl+C untuk keluar monitor.${W}"
-sleep 3
-done
+        sleep 3
+    done
 }
 
 start_monitor() {
@@ -96,10 +104,10 @@ start_monitor() {
         return
     fi
 
-    monitor_loop &
+    nohup bash -c "$(declare -f monitor_loop); PACKAGE='$PACKAGE'; monitor_loop" >/dev/null 2>&1 &
     echo $! > "$PIDFILE"
 
-    echo "Monitor dimulai."
+    echo "Monitor dimulai (berjalan di background, cek notifikasi)."
     sleep 2
 }
 
@@ -107,6 +115,9 @@ stop_monitor() {
     if [ -f "$PIDFILE" ]; then
         kill "$(cat "$PIDFILE")" 2>/dev/null
         rm -f "$PIDFILE"
+        if command -v termux-notification-remove >/dev/null 2>&1; then
+            termux-notification-remove dara_monitor
+        fi
         echo "Monitor dihentikan."
     else
         echo "Monitor tidak berjalan."
