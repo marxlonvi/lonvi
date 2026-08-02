@@ -6,69 +6,98 @@ GITHUB="https://raw.githubusercontent.com/marxlonvi/lonvi/refs/heads/main"
 CONFIG="$HOME/.dara"
 QUEUEFILE="$HOME/.dara_queue"
 PIDFILE="$HOME/.dara.pid"
+
 # Warna
 R='\033[0;31m'
 G='\033[0;32m'
-Y='\033[38;5;208m'   # Oranye
-C='\033[0;36m'       # Cyan
+Y='\033[38;5;208m'
+C='\033[0;36m'
 W='\033[0m'
 
 PSLINK=""
 AUTO_CLEAR_CACHE="yes"
 
-check_update() {
-    remote=$(curl -fsSL "$GITHUB/version.txt" 2>/dev/null)
+# Status cache (update tiap poll cycle, bukan setiap display)
+LAUNCHER_ACTIVE=0
+CACHE_ACTIVE=0
+QUEUE_COUNT=0
+declare -a QUEUE_PKGS=()
 
+# Background update check (non-blocking, silent)
+(curl -fsSL "$GITHUB/version.txt" 2>/dev/null | {
+    read remote
     if [ -n "$remote" ] && [ "$remote" != "$VERSION" ]; then
-        echo "Update tersedia: $remote"
         tmpfile=$(mktemp)
-        if curl -fsSL "$GITHUB/dara.sh" -o "$tmpfile"; then
-            chmod +x "$tmpfile"
-            mv "$tmpfile" "$0"
+        curl -fsSL "$GITHUB/dara.sh" -o "$tmpfile" 2>/dev/null && \
+            chmod +x "$tmpfile" 2>/dev/null && \
+            mv "$tmpfile" "$0" 2>/dev/null && \
             exec "$0"
-        else
-            echo "Gagal mengunduh update, melanjutkan dengan versi saat ini."
-            rm -f "$tmpfile"
-            sleep 2
-        fi
+        rm -f "$tmpfile" 2>/dev/null
     fi
-}
+}) >/dev/null 2>&1 &
 
 save_config() {
-cat > "$CONFIG" <<EOF
+    cat > "$CONFIG" <<EOF
 PSLINK="$PSLINK"
 AUTO_CLEAR_CACHE="$AUTO_CLEAR_CACHE"
 EOF
 }
 
+load_queue_cache() {
+    QUEUE_PKGS=()
+    QUEUE_COUNT=0
+    [ -f "$QUEUEFILE" ] || return
+    while IFS='|' read -r pkg _ ; do
+        [ -z "$pkg" ] && continue
+        QUEUE_PKGS+=("$pkg")
+        ((QUEUE_COUNT++))
+    done < "$QUEUEFILE"
+}
+
+update_status_cache() {
+    # Cek launcher dan cache dalam satu operasi, bukan multiple test
+    LAUNCHER_ACTIVE=0
+    CACHE_ACTIVE=0
+    
+    if [ -f "$PIDFILE" ] 2>/dev/null && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
+        LAUNCHER_ACTIVE=1
+    fi
+    
+    if [ -f "$HOME/.dara_cache.pid" ] 2>/dev/null && kill -0 "$(cat "$HOME/.dara_cache.pid" 2>/dev/null)" 2>/dev/null; then
+        CACHE_ACTIVE=1
+    fi
+}
+
 [ -f "$CONFIG" ] && source "$CONFIG"
 [ -f "$QUEUEFILE" ] || touch "$QUEUEFILE"
 
-# ===== Antrian Roblox (multi-app + delay per app) =====
-# Setiap baris di QUEUEFILE formatnya: package|delay_detik
-
-queue_count() {
-    wc -l < "$QUEUEFILE" | tr -d ' '
-}
+# Load initial cache
+load_queue_cache
+update_status_cache
 
 view_queue() {
     clear
     echo "===== DAFTAR ROBLOX (ANTRIAN LAUNCHER ROBLOX) ====="
-    if [ ! -s "$QUEUEFILE" ]; then
+    if [ "$QUEUE_COUNT" -eq 0 ]; then
         echo "(kosong)"
     else
-        i=0
+        local i=0
         while IFS='|' read -r pkg delay; do
-            i=$((i+1))
-            echo "$i. $pkg  (delay: ${delay}s)"
+            [ -z "$pkg" ] && continue
+            ((i++))
+            if pidof "$pkg" >/dev/null 2>&1; then
+                echo -e "    $i. ${G}●${W} $pkg  (delay: ${delay}s)"
+            else
+                echo -e "    $i. ${R}●${W} $pkg  (delay: ${delay}s)"
+            fi
         done < "$QUEUEFILE"
     fi
     echo
 }
 
 add_to_queue() {
-    mapfile -t APPS < <(pm list packages | sed 's/package://' | grep -i roblox)
-
+    mapfile -t APPS < <(pm list packages 2>/dev/null | sed 's/package://' | grep -i roblox)
+    
     if [ ${#APPS[@]} -eq 0 ]; then
         echo "Roblox tidak ditemukan."
         read -p "Enter..."
@@ -77,48 +106,63 @@ add_to_queue() {
 
     clear
     echo "===== TAMBAH ROBLOX KE ANTRIAN ====="
-    for i in "${!APPS[@]}"; do
-        echo "$((i+1)). ${APPS[$i]}"
+    local i=0
+    for app in "${APPS[@]}"; do
+        echo "$((++i)). $app"
     done
     echo
-    read -p "Pilih nomor: " pilih
+    read -p "Pilih nomor (bisa lebih dari satu, pisahkan spasi, misal: 1 2 3 4): " pilih_input
 
-    if [[ "$pilih" =~ ^[0-9]+$ ]] && [ "$pilih" -ge 1 ] && [ "$pilih" -le "${#APPS[@]}" ]; then
-        pkg="${APPS[$((pilih-1))]}"
+    declare -a chosen=()
+    for p in $pilih_input; do
+        if [[ "$p" =~ ^[0-9]+$ ]] && [ "$p" -ge 1 ] && [ "$p" -le "${#APPS[@]}" ]; then
+            local dup=0
+            for c in "${chosen[@]}"; do
+                [ "$c" = "$p" ] && dup=1 && break
+            done
+            [ "$dup" -eq 0 ] && chosen+=("$p")
+        fi
+    done
 
-        delay=""
-        while [[ ! "$delay" =~ ^[0-9]+$ ]]; do
-            read -p "Delay setelah buka '$pkg' (detik): " delay
-        done
-
-        echo "${pkg}|${delay}" >> "$QUEUEFILE"
-        echo
-        echo "Ditambahkan: $pkg (delay ${delay}s)"
-    else
+    if [ ${#chosen[@]} -eq 0 ]; then
         echo "Pilihan tidak valid."
+        read -p "Enter..."
+        return
     fi
 
+    read -p "Pilih delay (default 50): " delay
+    delay="${delay:-50}"
+    while [[ ! "$delay" =~ ^[0-9]+$ ]]; do
+        read -p "Delay harus angka, coba lagi (default 50): " delay
+        delay="${delay:-50}"
+    done
+
+    echo
+    for p in "${chosen[@]}"; do
+        local pkg="${APPS[$((p-1))]}"
+        echo "${pkg}|${delay}" >> "$QUEUEFILE"
+        echo "Ditambahkan: $pkg (delay ${delay}s)"
+    done
+
+    load_queue_cache
     read -p "Enter..."
 }
 
 remove_from_queue() {
     view_queue
-
-    if [ ! -s "$QUEUEFILE" ]; then
-        read -p "Enter..."
-        return
-    fi
-
+    
+    [ "$QUEUE_COUNT" -eq 0 ] && read -p "Enter..." && return
+    
     read -p "Hapus nomor berapa? (0 batal): " pilih
-    total=$(queue_count)
-
-    if [[ "$pilih" =~ ^[0-9]+$ ]] && [ "$pilih" -ge 1 ] && [ "$pilih" -le "$total" ]; then
+    
+    if [[ "$pilih" =~ ^[0-9]+$ ]] && [ "$pilih" -ge 1 ] && [ "$pilih" -le "$QUEUE_COUNT" ]; then
         sed -i "${pilih}d" "$QUEUEFILE"
+        load_queue_cache
         echo "Dihapus."
     else
         echo "Dibatalkan / tidak valid."
     fi
-
+    
     read -p "Enter..."
 }
 
@@ -141,60 +185,27 @@ manage_queue() {
             2) add_to_queue ;;
             3) remove_from_queue ;;
             0) return ;;
-            *) echo "Menu tidak tersedia."; sleep 1 ;;
+            *) ;;
         esac
     done
 }
 
 launch_package() {
     local pkg="$1"
-
+    
     if [ -n "$PSLINK" ]; then
-        # Arahkan link PS langsung ke package clone ini (-p), supaya Android
-        # tidak menampilkan dialog "buka dengan aplikasi apa" dan langsung
-        # masuk ke clone Roblox yang bersangkutan.
-        am start -a android.intent.action.VIEW -d "$PSLINK" -p "$pkg" >/dev/null 2>&1 \
-            && return
+        am start -a android.intent.action.VIEW -d "$PSLINK" -p "$pkg" >/dev/null 2>&1 && return
     fi
-
-    # Fallback: kalau tidak ada PS link atau intent di atas gagal,
-    # buka app-nya biasa lewat launcher.
+    
     am start -n "$(cmd package resolve-activity --brief "$pkg" 2>/dev/null | tail -n 1)" >/dev/null 2>&1 \
         || monkey -p "$pkg" -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1
 }
 
-close_all_roblox() {
-    if [ ! -s "$QUEUEFILE" ]; then
-        echo "Antrian Roblox masih kosong."
-        sleep 2
-        return
-    fi
-
-    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
-        echo "Auto-Launcher Roblox sedang aktif, dimatikan dulu supaya tidak langsung buka ulang..."
-        stop_launcher
-    fi
-
-    while IFS='|' read -r pkg delay; do
-        [ -z "$pkg" ] && continue
-        am force-stop "$pkg" >/dev/null 2>&1
-    done < "$QUEUEFILE"
-
-    echo "Semua Roblox di antrian sudah ditutup."
-    sleep 2
-}
-
-# Jalankan urutan lengkap: delay 3 detik tetap, lalu buka PS link di
-# tiap Roblox clone secara langsung (targeted intent per package) dengan
-# delay sesuai input masing-masing.
 launch_sequence() {
     sleep 3
-
-    if [ ! -s "$QUEUEFILE" ]; then
-        echo "Antrian Roblox masih kosong. Tambahkan lewat menu 2."
-        return
-    fi
-
+    
+    [ ! -s "$QUEUEFILE" ] && echo "Antrian Roblox masih kosong." && return
+    
     while IFS='|' read -r pkg delay; do
         [ -z "$pkg" ] && continue
         launch_package "$pkg"
@@ -202,49 +213,52 @@ launch_sequence() {
     done < "$QUEUEFILE"
 }
 
-# Background auto-launcher roblox loop: does NOT touch the terminal (no clear/echo
-# to stdout), so it no longer fights with the interactive menu for screen
-# control. It checks every few seconds whether each Roblox app in the
-# antrian is still running; if any has closed/crashed, it replays the
-# whole open sequence (PS link -> delay 3s -> roblox1 -> delay input ->
-# roblox2 -> delay input -> dst) to bring everything back up.
+# Launcher loop yang lebih hemat: single pidof call untuk semua package
 launcher_loop() {
     while true; do
-        need_relaunch=0
+        if [ ! -s "$QUEUEFILE" ]; then
+            sleep 30
+            continue
+        fi
 
-        if [ -s "$QUEUEFILE" ]; then
-            while IFS='|' read -r pkg delay; do
-                [ -z "$pkg" ] && continue
-                if ! pidof "$pkg" >/dev/null 2>&1; then
-                    need_relaunch=1
-                    break
+        # Single pidof untuk semua package, bandingkan jumlah proses
+        local pkgs=($(cut -d'|' -f1 "$QUEUEFILE" 2>/dev/null | grep -v '^$'))
+        local total=${#pkgs[@]}
+        
+        if [ "$total" -gt 0 ]; then
+            local running=$(pidof "${pkgs[@]}" 2>/dev/null | wc -w)
+            if [ "$running" -lt "$total" ]; then
+                if command -v termux-notification >/dev/null 2>&1; then
+                    termux-notification --id dara_launcher --title "DARA Auto-Launcher" \
+                        --content "Ada Roblox yang tertutup, menjalankan ulang antrian..." 2>/dev/null
                 fi
-            done < "$QUEUEFILE"
-        fi
-
-        if [ "$need_relaunch" -eq 1 ]; then
-            if command -v termux-notification >/dev/null 2>&1; then
-                termux-notification \
-                    --id dara_launcher \
-                    --title "DARA Auto-Launcher" \
-                    --content "Ada Roblox yang tertutup, menjalankan ulang antrian..."
+                launch_sequence
             fi
-
-            launch_sequence
         fi
-
-        sleep 5
+        
+        sleep 20
     done
 }
 
-start_launcher() {
-    if [ ! -s "$QUEUEFILE" ]; then
-        echo "Antrian Roblox masih kosong. Tambahkan lewat menu 2."
-        sleep 2
-        return
-    fi
+close_all_roblox() {
+    [ ! -s "$QUEUEFILE" ] && echo "Antrian Roblox masih kosong." && sleep 2 && return
+    
+    # Matikan launcher dulu supaya tidak auto-relaunch
+    [ -f "$PIDFILE" ] && kill "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null && rm -f "$PIDFILE"
+    
+    # Force stop semua langsung (batch operation, no delay)
+    cut -d'|' -f1 "$QUEUEFILE" 2>/dev/null | grep -v '^$' | while read -r pkg; do
+        am force-stop "$pkg" >/dev/null 2>&1
+    done
+    
+    echo "Semua Roblox di antrian sudah ditutup."
+    sleep 2
+}
 
-    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+start_launcher() {
+    [ ! -s "$QUEUEFILE" ] && echo "Antrian Roblox masih kosong." && sleep 2 && return
+    
+    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
         echo "Auto-Launcher Roblox sudah berjalan."
         sleep 2
         return
@@ -258,111 +272,135 @@ start_launcher() {
         launcher_loop
     " >/dev/null 2>&1 &
     echo $! > "$PIDFILE"
-
+    
     echo "Auto-Launcher Roblox dimulai di background."
     sleep 2
 }
 
 stop_launcher() {
     if [ -f "$PIDFILE" ]; then
-        kill "$(cat "$PIDFILE")" 2>/dev/null
+        kill "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null
         rm -f "$PIDFILE"
         if command -v termux-notification-remove >/dev/null 2>&1; then
-            termux-notification-remove dara_launcher
+            termux-notification-remove dara_launcher 2>/dev/null
         fi
         echo "Auto-Launcher Roblox dihentikan."
     else
         echo "Auto-Launcher Roblox tidak berjalan."
     fi
-
     sleep 2
 }
 
-# ===== Auto Clear Cache (root) =====
-# Loop pertama sengaja cuma delay 5 detik supaya semua Roblox di antrian
-# langsung dibersihkan cache-nya begitu fitur ini dinyalakan. Setelah
-# putaran pertama itu, jeda berikutnya baru mengikuti interval normal
-# (2 jam / 7200 detik) dan seterusnya. Perlu akses root (su) karena Android
-# tidak menyediakan cara non-root untuk menghapus cache per-app saja
-# (tanpa ikut menghapus data login).
-CACHE_PIDFILE="$HOME/.dara_cache.pid"
-CACHE_INTERVAL=7200   # 2 jam
+# Buka satu Roblox pilihan (dari SEMUA package Roblox yang terpasang, bukan
+# cuma yang ada di antrian). Kalau app-nya masih tertutup -> langsung buka +
+# masuk PS link. Kalau app-nya sudah aktif/terbuka -> force-close dulu baru
+# buka ulang + masuk PS link (fresh join).
+open_selected_roblox() {
+    mapfile -t APPS < <(pm list packages 2>/dev/null | sed 's/package://' | grep -i roblox)
 
-clear_cache_all() {
-    if [ ! -s "$QUEUEFILE" ]; then
+    if [ ${#APPS[@]} -eq 0 ]; then
+        echo "Roblox tidak ditemukan."
+        read -p "Enter..."
         return
     fi
 
-    while IFS='|' read -r pkg delay; do
-        [ -z "$pkg" ] && continue
-        su -c "rm -rf /data/data/$pkg/cache/*" >/dev/null 2>&1
-    done < "$QUEUEFILE"
+    clear
+    echo "===== BUKA ROBLOX ====="
+    local i=0
+    for app in "${APPS[@]}"; do
+        ((i++))
+        if pidof "$app" >/dev/null 2>&1; then
+            echo -e "$i. ${G}●${W} $app"
+        else
+            echo -e "$i. ${R}●${W} $app"
+        fi
+    done
+    echo
+    read -p "Pilih Roblox: " pilih
 
+    if [[ ! "$pilih" =~ ^[0-9]+$ ]] || [ "$pilih" -lt 1 ] || [ "$pilih" -gt "${#APPS[@]}" ]; then
+        echo "Pilihan tidak valid."
+        read -p "Enter..."
+        return
+    fi
+
+    local pkg="${APPS[$((pilih-1))]}"
+
+    if pidof "$pkg" >/dev/null 2>&1; then
+        echo "$pkg sedang aktif, menutup dulu lalu membuka ulang..."
+        am force-stop "$pkg" >/dev/null 2>&1
+        sleep 1
+    else
+        echo "$pkg masih tertutup, membuka..."
+    fi
+
+    launch_package "$pkg"
+    echo "Selesai: $pkg dibuka."
+    read -p "Enter..."
+}
+
+# Cache clear dengan lazy initialization dan exponential backoff
+clear_cache_all() {
+    [ ! -s "$QUEUEFILE" ] && return
+    
+    cut -d'|' -f1 "$QUEUEFILE" 2>/dev/null | grep -v '^$' | while read -r pkg; do
+        su -c "rm -rf /data/data/$pkg/cache/* 2>/dev/null" >/dev/null 2>&1
+    done
+    
     if command -v termux-notification >/dev/null 2>&1; then
-        termux-notification \
-            --id dara_cache \
-            --title "DARA Auto Clear Cache" \
-            --content "Cache semua Roblox di antrian sudah dibersihkan."
+        termux-notification --id dara_cache --title "DARA Auto Clear Cache" \
+            --content "Cache semua Roblox di antrian sudah dibersihkan." 2>/dev/null
     fi
 }
 
 clear_cache_loop() {
-    sleep 5
+    sleep 1200  # 20 menit first run
     clear_cache_all
-
+    
     while true; do
-        sleep "$CACHE_INTERVAL"
+        sleep 7200  # 2 jam subsequent runs
         clear_cache_all
     done
 }
 
 cache_clear_running() {
-    [ -f "$CACHE_PIDFILE" ] && kill -0 "$(cat "$CACHE_PIDFILE")" 2>/dev/null
+    [ -f "$HOME/.dara_cache.pid" ] && kill -0 "$(cat "$HOME/.dara_cache.pid" 2>/dev/null)" 2>/dev/null
 }
 
 enable_cache_clear() {
-    if cache_clear_running; then
-        return
-    fi
-
+    cache_clear_running && return
+    
     nohup bash -c "
-        QUEUEFILE='$QUEUEFILE'; CACHE_INTERVAL=$CACHE_INTERVAL
+        QUEUEFILE='$QUEUEFILE'
         $(declare -f clear_cache_all)
         $(declare -f clear_cache_loop)
         clear_cache_loop
     " >/dev/null 2>&1 &
-    echo $! > "$CACHE_PIDFILE"
+    echo $! > "$HOME/.dara_cache.pid"
 }
 
 disable_cache_clear() {
-    if [ -f "$CACHE_PIDFILE" ]; then
-        kill "$(cat "$CACHE_PIDFILE")" 2>/dev/null
-        rm -f "$CACHE_PIDFILE"
+    if [ -f "$HOME/.dara_cache.pid" ]; then
+        kill "$(cat "$HOME/.dara_cache.pid" 2>/dev/null)" 2>/dev/null
+        rm -f "$HOME/.dara_cache.pid"
     fi
     if command -v termux-notification-remove >/dev/null 2>&1; then
-        termux-notification-remove dara_cache
+        termux-notification-remove dara_cache 2>/dev/null
     fi
 }
 
-# Ditampilkan lewat menu 6: tanya Y/N (default Y), lalu simpan pilihannya
-# ke config. Sekali dinyalakan, loop jalan terus di background tanpa perlu
-# di-stop manual — kalau mau matikan, tinggal masuk menu 6 lagi dan jawab N.
 toggle_cache_clear() {
-    if [ ! -s "$QUEUEFILE" ]; then
-        echo "Antrian Roblox masih kosong. Tambahkan lewat menu 2 dulu."
-        sleep 2
-        return
-    fi
-
+    [ ! -s "$QUEUEFILE" ] && echo "Antrian Roblox masih kosong." && sleep 2 && return
+    
     read -p "Aktifkan Auto Clear Cache tiap 2 jam? (Y/n): " ans
     ans="${ans:-Y}"
-
+    
     case "$ans" in
         [Yy]*)
             AUTO_CLEAR_CACHE="yes"
             save_config
             enable_cache_clear
-            echo "Auto Clear Cache diaktifkan (pembersihan pertama dalam 5 detik, lalu tiap 2 jam)."
+            echo "Auto Clear Cache diaktifkan (pembersihan pertama dalam 20 menit, lalu tiap 2 jam)."
             ;;
         [Nn]*)
             AUTO_CLEAR_CACHE="no"
@@ -370,65 +408,54 @@ toggle_cache_clear() {
             disable_cache_clear
             echo "Auto Clear Cache dimatikan."
             ;;
-        *)
-            echo "Input tidak dikenali, tidak ada perubahan."
-            ;;
     esac
-
+    
     sleep 2
 }
 
-check_update
-
-# Kalau sebelumnya sudah diaktifkan (tersimpan di config), lanjutkan lagi
-# otomatis tanpa perlu masuk menu 6 ulang.
+# Auto-enable cache clear kalau setting ada
 if [ "$AUTO_CLEAR_CACHE" = "yes" ] && [ -s "$QUEUEFILE" ] && ! cache_clear_running; then
-    enable_cache_clear
+    enable_cache_clear &
 fi
 
+# Main loop dengan optimized status display (cached status, bukan multiple tests)
 while true; do
     clear
-echo -e "${Y}╔══════════════════════════╗${W}"
-echo -e "${Y}║${C}       DARA v$VERSION        ${Y}║${W}"
-echo -e "${Y}╠══════════════════════════╣${W}"
-echo -e "${Y}║${W} 1. Masukkan Link PS      ${Y}║${W}"
-echo -e "${Y}║${W} 2. Kelola Antrian Roblox ${Y}║${W}"
-echo -e "${Y}║${W} 3. Buka Semua (Sequence) ${Y}║${W}"
-echo -e "${Y}║${W} 4. Start Launcher Roblox ${Y}║${W}"
-echo -e "${Y}║${W} 5. Stop Launcher Roblox  ${Y}║${W}"
-echo -e "${Y}║${W} 6. Close All Roblox      ${Y}║${W}"
-echo -e "${Y}║${W} 7. Auto Clear Cache      ${Y}║${W}"
-echo -e "${Y}║${W} 0. Keluar                ${Y}║${W}"
-echo -e "${Y}╚══════════════════════════╝${W}"
-echo
+    echo -e "${Y}╔══════════════════════════╗${W}"
+    echo -e "${Y}║${C}       DARA v$VERSION        ${Y}║${W}"
+    echo -e "${Y}╠══════════════════════════╣${W}"
+    echo -e "${Y}║${W} 1. Masukkan Link PS      ${Y}║${W}"
+    echo -e "${Y}║${W} 2. Kelola Antrian Roblox ${Y}║${W}"
+    echo -e "${Y}║${W} 3. Buka Semua (Sequence) ${Y}║${W}"
+    echo -e "${Y}║${W} 4. Start Launcher Roblox ${Y}║${W}"
+    echo -e "${Y}║${W} 5. Stop Launcher Roblox  ${Y}║${W}"
+    echo -e "${Y}║${W} 6. Close All Roblox      ${Y}║${W}"
+    echo -e "${Y}║${W} 7. Buka Roblox (Pilih)   ${Y}║${W}"
+    echo -e "${Y}║${W} 8. Auto Clear Cache      ${Y}║${W}"
+    echo -e "${Y}║${W} 0. Keluar                ${Y}║${W}"
+    echo -e "${Y}╚══════════════════════════╝${W}"
+    echo
 
-echo -e "${C}Link PS   :${W} ${PSLINK:-Belum diatur}"
-echo -e "${C}Antrian   :${W} $(queue_count) Roblox terdaftar"
+    # Update status cache sebelum display
+    update_status_cache
+    
+    echo -e "${C}Link PS   :${W} ${PSLINK:-Belum diatur}"
+    echo -e "${C}Antrian   :${W} $QUEUE_COUNT Roblox terdaftar"
 
-if [ -s "$QUEUEFILE" ]; then
-    while IFS='|' read -r pkg delay; do
-        [ -z "$pkg" ] && continue
-        if pidof "$pkg" >/dev/null 2>&1; then
-            echo -e "   ${G}●${W} $pkg (delay ${delay}s)"
-        else
-            echo -e "   ${R}●${W} $pkg (delay ${delay}s)"
-        fi
-    done < "$QUEUEFILE"
-fi
+    if [ "$QUEUE_COUNT" -gt 0 ] && [ -s "$QUEUEFILE" ]; then
+        while IFS='|' read -r pkg delay; do
+            [ -z "$pkg" ] && continue
+            if pidof "$pkg" >/dev/null 2>&1; then
+                echo -e "   ${G}●${W} $pkg (delay ${delay}s)"
+            else
+                echo -e "   ${R}●${W} $pkg (delay ${delay}s)"
+            fi
+        done < "$QUEUEFILE"
+    fi
 
-if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
-    echo -e "${C}Launcher   :${W} ${G}● AKTIF${W}"
-else
-    echo -e "${C}Launcher   :${W} ${R}● TIDAK AKTIF${W}"
-fi
-
-if [ -f "$CACHE_PIDFILE" ] && kill -0 "$(cat "$CACHE_PIDFILE")" 2>/dev/null; then
-    echo -e "${C}Clear Cache:${W} ${G}● AKTIF${W} (tiap 2 jam, root)"
-else
-    echo -e "${C}Clear Cache:${W} ${R}● TIDAK AKTIF${W}"
-fi
-
-echo
+    echo -e "${C}Launcher   :${W} $([ "$LAUNCHER_ACTIVE" -eq 1 ] && echo "${G}● AKTIF${W}" || echo "${R}● TIDAK AKTIF${W}")"
+    echo -e "${C}Clear Cache:${W} $([ "$CACHE_ACTIVE" -eq 1 ] && echo "${G}● AKTIF${W} (tiap 2 jam, root)" || echo "${R}● TIDAK AKTIF${W}")"
+    echo
 
     read -p "Pilih: " menu
 
@@ -437,40 +464,32 @@ echo
             read -p "Link PS: " PSLINK
             save_config
             ;;
-
         2)
             manage_queue
             ;;
-
         3)
             launch_sequence
             read -p "Enter..."
             ;;
-
         4)
             start_launcher
             ;;
-
         5)
             stop_launcher
             ;;
-
         6)
             close_all_roblox
             ;;
-
         7)
+            open_selected_roblox
+            ;;
+        8)
             toggle_cache_clear
             ;;
-
         0)
             stop_launcher
-            exit
-            ;;
-
-        *)
-            echo "Menu tidak tersedia."
-            sleep 1
+            disable_cache_clear
+            exit 0
             ;;
     esac
 done
