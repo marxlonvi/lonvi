@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 
-VERSION="1.0.6"
+VERSION="1.0.1"
 GITHUB="https://raw.githubusercontent.com/marxlonvi/lonvi/refs/heads/main"
 
 CONFIG="$HOME/.dara"
@@ -273,17 +273,59 @@ launcher_loop() {
 }
 
 close_all_roblox() {
-    [ ! -s "$QUEUEFILE" ] && echo "Antrian Roblox masih kosong." && sleep 2 && return
-    
-    # Matikan launcher dulu supaya tidak auto-relaunch
-    [ -f "$PIDFILE" ] && kill "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null && rm -f "$PIDFILE"
-    
-    # Force stop semua langsung (batch operation, no delay)
-    cut -d'|' -f1 "$QUEUEFILE" 2>/dev/null | grep -v '^$' | while read -r pkg; do
+    mapfile -t ALL_ROBLOX < <(pm list packages 2>/dev/null | sed 's/package://' | grep -i roblox)
+
+    if [ ${#ALL_ROBLOX[@]} -eq 0 ]; then
+        echo "Tidak ada Roblox terpasang di device."
+        sleep 2
+        return
+    fi
+
+    # Matikan launcher dulu supaya tidak auto-relaunch pas kita force-stop
+    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
+        kill "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null
+        rm -f "$PIDFILE"
+    fi
+
+    echo "Menutup paksa ${#ALL_ROBLOX[@]} Roblox..."
+
+    for pkg in "${ALL_ROBLOX[@]}"; do
+        # Coba beberapa metode sekaligus supaya benar-benar mati apapun
+        # kondisinya (am force-stop bisa gagal kalau ada dialog/izin aneh,
+        # jadi di-backup dengan su force-stop dan kill proses langsung).
         am force-stop "$pkg" >/dev/null 2>&1
+        am kill "$pkg" >/dev/null 2>&1
+
+        if command -v su >/dev/null 2>&1; then
+            su -c "am force-stop $pkg" >/dev/null 2>&1
+        fi
+
+        pid=$(pidof "$pkg" 2>/dev/null)
+        if [ -n "$pid" ]; then
+            kill -9 $pid >/dev/null 2>&1
+            if command -v su >/dev/null 2>&1; then
+                su -c "kill -9 $pid" >/dev/null 2>&1
+            fi
+        fi
     done
-    
-    echo "Semua Roblox di antrian sudah ditutup."
+
+    sleep 1
+
+    # Verifikasi hasil
+    local masih_aktif=0
+    for pkg in "${ALL_ROBLOX[@]}"; do
+        if pidof "$pkg" >/dev/null 2>&1; then
+            masih_aktif=$((masih_aktif+1))
+            echo -e "   ${R}●${W} $pkg masih aktif"
+        fi
+    done
+
+    if [ "$masih_aktif" -eq 0 ]; then
+        echo "Semua Roblox berhasil ditutup paksa."
+    else
+        echo "$masih_aktif Roblox masih belum mati (mungkin butuh akses root/su untuk paksa penuh)."
+    fi
+
     sleep 2
 }
 
