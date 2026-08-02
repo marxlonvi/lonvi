@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 
-VERSION="1.0.5"
+VERSION="1.0.1"
 GITHUB="https://raw.githubusercontent.com/marxlonvi/lonvi/refs/heads/main"
 
 CONFIG="$HOME/.dara"
@@ -153,16 +153,48 @@ remove_from_queue() {
     
     [ "$QUEUE_COUNT" -eq 0 ] && read -p "Enter..." && return
     
-    read -p "Hapus nomor berapa? (0 batal): " pilih
-    
-    if [[ "$pilih" =~ ^[0-9]+$ ]] && [ "$pilih" -ge 1 ] && [ "$pilih" -le "$QUEUE_COUNT" ]; then
-        sed -i "${pilih}d" "$QUEUEFILE"
-        load_queue_cache
-        echo "Dihapus."
-    else
-        echo "Dibatalkan / tidak valid."
+    read -p "Hapus nomor berapa? (pisahkan spasi utk banyak, 'all' utk semua, 0 batal): " pilih_input
+
+    if [ "$pilih_input" = "0" ]; then
+        echo "Dibatalkan."
+        read -p "Enter..."
+        return
     fi
-    
+
+    if [[ "$pilih_input" =~ ^([Aa][Ll][Ll])$ ]]; then
+        > "$QUEUEFILE"
+        load_queue_cache
+        echo "Semua antrian dihapus."
+        read -p "Enter..."
+        return
+    fi
+
+    declare -a nums=()
+    for p in $pilih_input; do
+        if [[ "$p" =~ ^[0-9]+$ ]] && [ "$p" -ge 1 ] && [ "$p" -le "$QUEUE_COUNT" ]; then
+            local dup=0
+            for c in "${nums[@]}"; do
+                [ "$c" = "$p" ] && dup=1 && break
+            done
+            [ "$dup" -eq 0 ] && nums+=("$p")
+        fi
+    done
+
+    if [ ${#nums[@]} -eq 0 ]; then
+        echo "Tidak ada nomor valid / dibatalkan."
+        read -p "Enter..."
+        return
+    fi
+
+    # Urutkan descending supaya nomor baris tidak bergeser saat dihapus satu-satu
+    IFS=$'\n' nums=($(sort -rn <<<"${nums[*]}")); unset IFS
+
+    for n in "${nums[@]}"; do
+        sed -i "${n}d" "$QUEUEFILE"
+    done
+
+    load_queue_cache
+    echo "Dihapus ${#nums[@]} entri dari antrian."
     read -p "Enter..."
 }
 
