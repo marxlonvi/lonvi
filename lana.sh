@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 
-VERSION="1.1.5"
+VERSION="1.1.6"
 GITHUB="https://raw.githubusercontent.com/marxlonvi/lonvi/refs/heads/main"
 
 CONFIG="$HOME/.lana"
