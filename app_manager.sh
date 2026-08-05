@@ -156,10 +156,12 @@ jalankan() {
     while IFS= read -r pkg; do
         [ -z "$pkg" ] && continue
         printf "Menjalankan %s ... " "$pkg"
-        if monkey -p "$pkg" -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1; then
-            echo "OK"
-        else
+        out=$(am start -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -p "$pkg" 2>&1)
+        if echo "$out" | grep -qi "Error\|Exception\|Denial"; then
             echo "GAGAL"
+            echo "  -> $out"
+        else
+            echo "OK"
         fi
         sleep 1
     done < "$QUEUE_FILE"
