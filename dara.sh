@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 
-VERSION="1.0.7"
+VERSION="1.0.1"
 GITHUB="https://raw.githubusercontent.com/marxlonvi/lonvi/refs/heads/main"
 
 CONFIG="$HOME/.dara"
@@ -16,10 +16,40 @@ W='\033[0m'
 
 PSLINK=""
 AUTO_CLEAR_CACHE="yes"
+AUTO_RAM_BOOST="no"
+RAM_BOOST_INTERVAL="60"
+
+RAMPIDFILE="$HOME/.dara_ramboost.pid"
+
+# Paket yang TIDAK BOLEH di-kill (aman): sistem, launcher, termux, dan
+# apapun yang ada di antrian Roblox (biar tidak ikut tertutup oleh RAM booster)
+RAM_BOOST_WHITELIST_PATTERN="^(com\.android\.|com\.google\.android\.(gms|gsf|inputmethod|packageinstaller)|com\.termux|android$|system$)"
+
+# ===== ROOT CHECK (cached, satu kali, dengan timeout) =====
+# Dulu setiap fitur yang butuh root (close all, cache clear, ram boost)
+# manggil `su -c ...` berkali-kali di dalam loop tanpa timeout. Kalau
+# popup izin root tidak langsung di-tap, Termux ke-block nunggu su selesai
+# -> keliatan "freeze", tidak bisa input, dan output numpuk pas akhirnya
+# lepas (menu jadi berantakan). Sekarang root dicek SEKALI di awal,
+# hasilnya di-cache, dan tiap su selalu dibungkus timeout.
+ROOT_OK=0
+check_root() {
+    if command -v su >/dev/null 2>&1; then
+        if timeout 5 su -c 'echo ok' >/dev/null 2>&1; then
+            ROOT_OK=1
+        else
+            ROOT_OK=0
+        fi
+    else
+        ROOT_OK=0
+    fi
+}
+check_root
 
 # Status cache (update tiap poll cycle, bukan setiap display)
 LAUNCHER_ACTIVE=0
 CACHE_ACTIVE=0
+RAMBOOST_ACTIVE=0
 QUEUE_COUNT=0
 declare -a QUEUE_PKGS=()
 
@@ -40,6 +70,8 @@ save_config() {
     cat > "$CONFIG" <<EOF
 PSLINK="$PSLINK"
 AUTO_CLEAR_CACHE="$AUTO_CLEAR_CACHE"
+AUTO_RAM_BOOST="$AUTO_RAM_BOOST"
+RAM_BOOST_INTERVAL="$RAM_BOOST_INTERVAL"
 EOF
 }
 
@@ -65,6 +97,11 @@ update_status_cache() {
     
     if [ -f "$HOME/.dara_cache.pid" ] 2>/dev/null && kill -0 "$(cat "$HOME/.dara_cache.pid" 2>/dev/null)" 2>/dev/null; then
         CACHE_ACTIVE=1
+    fi
+
+    RAMBOOST_ACTIVE=0
+    if [ -f "$RAMPIDFILE" ] 2>/dev/null && kill -0 "$(cat "$RAMPIDFILE" 2>/dev/null)" 2>/dev/null; then
+        RAMBOOST_ACTIVE=1
     fi
 }
 
@@ -273,6 +310,7 @@ launcher_loop() {
 }
 
 close_all_roblox() {
+    clear
     mapfile -t ALL_ROBLOX < <(pm list packages 2>/dev/null | sed 's/package://' | grep -i roblox)
 
     if [ ${#ALL_ROBLOX[@]} -eq 0 ]; then
@@ -289,24 +327,27 @@ close_all_roblox() {
 
     echo "Menutup paksa ${#ALL_ROBLOX[@]} Roblox..."
 
+    # Non-root: force-stop biasa per package (cepat, tidak butuh su)
     for pkg in "${ALL_ROBLOX[@]}"; do
-        # Coba beberapa metode sekaligus supaya benar-benar mati apapun
-        # kondisinya (am force-stop bisa gagal kalau ada dialog/izin aneh,
-        # jadi di-backup dengan su force-stop dan kill proses langsung).
         am force-stop "$pkg" >/dev/null 2>&1
-        am kill "$pkg" >/dev/null 2>&1
+    done
 
-        if command -v su >/dev/null 2>&1; then
-            su -c "am force-stop $pkg" >/dev/null 2>&1
-        fi
+    # Root (kalau ada): SATU panggilan su untuk semua package sekaligus,
+    # dibungkus timeout supaya tidak pernah menggantung nunggu popup izin.
+    if [ "$ROOT_OK" -eq 1 ]; then
+        local su_cmd=""
+        for pkg in "${ALL_ROBLOX[@]}"; do
+            su_cmd+="am force-stop $pkg; "
+            pid=$(pidof "$pkg" 2>/dev/null)
+            [ -n "$pid" ] && su_cmd+="kill -9 $pid 2>/dev/null; "
+        done
+        timeout 8 su -c "$su_cmd" >/dev/null 2>&1
+    fi
 
+    # Sisa proses yang masih hidup tanpa root, kill langsung (best effort)
+    for pkg in "${ALL_ROBLOX[@]}"; do
         pid=$(pidof "$pkg" 2>/dev/null)
-        if [ -n "$pid" ]; then
-            kill -9 $pid >/dev/null 2>&1
-            if command -v su >/dev/null 2>&1; then
-                su -c "kill -9 $pid" >/dev/null 2>&1
-            fi
-        fi
+        [ -n "$pid" ] && kill -9 $pid >/dev/null 2>&1
     done
 
     sleep 1
@@ -416,11 +457,16 @@ open_selected_roblox() {
 # Cache clear dengan lazy initialization dan exponential backoff
 clear_cache_all() {
     [ ! -s "$QUEUEFILE" ] && return
-    
-    cut -d'|' -f1 "$QUEUEFILE" 2>/dev/null | grep -v '^$' | while read -r pkg; do
-        su -c "rm -rf /data/data/$pkg/cache/* 2>/dev/null" >/dev/null 2>&1
-    done
-    
+    [ "$ROOT_OK" -ne 1 ] && return
+
+    local su_cmd=""
+    while IFS='|' read -r pkg _; do
+        [ -z "$pkg" ] && continue
+        su_cmd+="rm -rf /data/data/$pkg/cache/* 2>/dev/null; "
+    done < "$QUEUEFILE"
+
+    [ -n "$su_cmd" ] && timeout 15 su -c "$su_cmd" >/dev/null 2>&1
+
     if command -v termux-notification >/dev/null 2>&1; then
         termux-notification --id dara_cache --title "DARA Auto Clear Cache" \
             --content "Cache semua Roblox di antrian sudah dibersihkan." 2>/dev/null
@@ -446,6 +492,7 @@ enable_cache_clear() {
     
     nohup bash -c "
         QUEUEFILE='$QUEUEFILE'
+        ROOT_OK='$ROOT_OK'
         $(declare -f clear_cache_all)
         $(declare -f clear_cache_loop)
         clear_cache_loop
@@ -461,6 +508,124 @@ disable_cache_clear() {
     if command -v termux-notification-remove >/dev/null 2>&1; then
         termux-notification-remove dara_cache 2>/dev/null
     fi
+}
+
+# ===== RAM BOOSTER =====
+# Kill aplikasi pihak ketiga yang berjalan di latar belakang dan aman
+# untuk dimatikan (bukan sistem, bukan Termux, bukan Roblox yang lagi
+# di-launch/di-antrian). Tujuannya membebaskan RAM tanpa mengganggu
+# proses penting.
+ram_boost_once() {
+    # Kumpulkan package yang harus dilindungi (whitelist dinamis: isi antrian)
+    declare -A PROTECT=()
+    if [ -s "$QUEUEFILE" ]; then
+        while IFS='|' read -r pkg _; do
+            [ -z "$pkg" ] && continue
+            PROTECT["$pkg"]=1
+        done < "$QUEUEFILE"
+    fi
+
+    # Ambil semua package pihak ketiga (bukan sistem) yang PROSESNYA aktif
+    local killed=0
+    local pkg
+    local su_cmd=""
+    while read -r pkg; do
+        [ -z "$pkg" ] && continue
+
+        # Lewati kalau masuk whitelist statis (sistem/termux/dara sendiri)
+        [[ "$pkg" =~ $RAM_BOOST_WHITELIST_PATTERN ]] && continue
+
+        # Lewati kalau ada di antrian Roblox (biar tidak mati saat lagi dipakai)
+        [ -n "${PROTECT[$pkg]}" ] && continue
+
+        # Cuma proses yang benar-benar jalan di background
+        if pidof "$pkg" >/dev/null 2>&1; then
+            am force-stop "$pkg" >/dev/null 2>&1
+            [ "$ROOT_OK" -eq 1 ] && su_cmd+="am force-stop $pkg; "
+            killed=$((killed+1))
+        fi
+    done < <(pm list packages -3 2>/dev/null | sed 's/package://')
+
+    # Satu panggilan su untuk semua package, dibungkus timeout (bukan
+    # loop per-package) supaya tidak pernah menggantung nunggu popup izin.
+    if [ "$ROOT_OK" -eq 1 ] && [ -n "$su_cmd" ]; then
+        timeout 8 su -c "$su_cmd" >/dev/null 2>&1
+    fi
+
+    if [ "$killed" -gt 0 ] && command -v termux-notification >/dev/null 2>&1; then
+        termux-notification --id dara_ramboost --title "DARA RAM Booster" \
+            --content "$killed aplikasi latar belakang ditutup untuk membebaskan RAM." 2>/dev/null
+    fi
+}
+
+ram_boost_loop() {
+    local interval="$1"
+    [[ "$interval" =~ ^[0-9]+$ ]] || interval=60
+    [ "$interval" -lt 5 ] && interval=5
+
+    while true; do
+        sleep "$interval"
+        ram_boost_once
+    done
+}
+
+ram_boost_running() {
+    [ -f "$RAMPIDFILE" ] && kill -0 "$(cat "$RAMPIDFILE" 2>/dev/null)" 2>/dev/null
+}
+
+enable_ram_boost() {
+    local interval="${1:-$RAM_BOOST_INTERVAL}"
+    ram_boost_running && return
+
+    nohup bash -c "
+        QUEUEFILE='$QUEUEFILE'
+        RAM_BOOST_WHITELIST_PATTERN='$RAM_BOOST_WHITELIST_PATTERN'
+        ROOT_OK='$ROOT_OK'
+        $(declare -f ram_boost_once)
+        $(declare -f ram_boost_loop)
+        ram_boost_loop '$interval'
+    " >/dev/null 2>&1 &
+    echo $! > "$RAMPIDFILE"
+}
+
+disable_ram_boost() {
+    if [ -f "$RAMPIDFILE" ]; then
+        kill "$(cat "$RAMPIDFILE" 2>/dev/null)" 2>/dev/null
+        rm -f "$RAMPIDFILE"
+    fi
+    if command -v termux-notification-remove >/dev/null 2>&1; then
+        termux-notification-remove dara_ramboost 2>/dev/null
+    fi
+}
+
+toggle_ram_boost() {
+    read -p "Aktifkan RAM Booster (kill app latar belakang otomatis)? (Y/n): " ans
+    ans="${ans:-Y}"
+
+    case "$ans" in
+        [Yy]*)
+            read -p "Interval kill (detik, default 60, min 5): " iv
+            iv="${iv:-60}"
+            while [[ ! "$iv" =~ ^[0-9]+$ ]] || [ "$iv" -lt 5 ]; do
+                read -p "Interval harus angka >= 5, coba lagi (default 60): " iv
+                iv="${iv:-60}"
+            done
+            RAM_BOOST_INTERVAL="$iv"
+            AUTO_RAM_BOOST="yes"
+            save_config
+            disable_ram_boost
+            enable_ram_boost "$iv"
+            echo "RAM Booster diaktifkan, kill app background tiap ${iv} detik."
+            ;;
+        [Nn]*)
+            AUTO_RAM_BOOST="no"
+            save_config
+            disable_ram_boost
+            echo "RAM Booster dimatikan."
+            ;;
+    esac
+
+    sleep 2
 }
 
 toggle_cache_clear() {
@@ -492,6 +657,11 @@ if [ "$AUTO_CLEAR_CACHE" = "yes" ] && [ -s "$QUEUEFILE" ] && ! cache_clear_runni
     enable_cache_clear &
 fi
 
+# Auto-enable ram booster kalau setting ada
+if [ "$AUTO_RAM_BOOST" = "yes" ] && ! ram_boost_running; then
+    enable_ram_boost "$RAM_BOOST_INTERVAL" &
+fi
+
 # Main loop dengan optimized status display (cached status, bukan multiple tests)
 while true; do
     clear
@@ -506,6 +676,7 @@ while true; do
     echo -e "${Y}║${W} 6. Close All Roblox      ${Y}║${W}"
     echo -e "${Y}║${W} 7. Buka Roblox (Pilih)   ${Y}║${W}"
     echo -e "${Y}║${W} 8. Auto Clear Cache      ${Y}║${W}"
+    echo -e "${Y}║${W} 9. RAM Booster (Kill BG) ${Y}║${W}"
     echo -e "${Y}║${W} 0. Keluar                ${Y}║${W}"
     echo -e "${Y}╚══════════════════════════╝${W}"
     echo
@@ -529,6 +700,7 @@ while true; do
 
     echo -e "${C}Launcher   :${W} $([ "$LAUNCHER_ACTIVE" -eq 1 ] && echo "${G}● AKTIF${W}" || echo "${R}● TIDAK AKTIF${W}")"
     echo -e "${C}Clear Cache:${W} $([ "$CACHE_ACTIVE" -eq 1 ] && echo "${G}● AKTIF${W} (tiap 2 jam, root)" || echo "${R}● TIDAK AKTIF${W}")"
+    echo -e "${C}RAM Booster:${W} $([ "$RAMBOOST_ACTIVE" -eq 1 ] && echo "${G}● AKTIF${W} (tiap ${RAM_BOOST_INTERVAL}s)" || echo "${R}● TIDAK AKTIF${W}")"
     echo
 
     read -p "Pilih: " menu
@@ -560,9 +732,13 @@ while true; do
         8)
             toggle_cache_clear
             ;;
+        9)
+            toggle_ram_boost
+            ;;
         0)
             stop_launcher
             disable_cache_clear
+            disable_ram_boost
             exit 0
             ;;
     esac
