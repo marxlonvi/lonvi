@@ -7,7 +7,7 @@
 
 export PATH="/data/data/com.termux/files/usr/bin:$PATH"
 
-VERSION="1.0.10_improved"
+VERSION="1.1.2"
 GITHUB="https://raw.githubusercontent.com/marxlonvi/lonvi/refs/heads/main"
 
 CONFIG="$HOME/.dara"
