@@ -1,16 +1,19 @@
 #!/data/data/com.termux/files/usr/bin/bash
 
-# Pastikan semua binary Termux (bash, timeout, nohup, dll) tetap ketemu
-# walaupun script ini dijalankan dari shell root (su), yang PATH-nya
-# biasanya di-reset ke /system/bin dkk dan tidak include folder Termux.
+# ═══════════════════════════════════════════════════════════════════════════
+# DARA - Roblox Multi-Instance Manager for Termux
+# Improved version dengan perbaikan error handling, stability, dan UX
+# ═══════════════════════════════════════════════════════════════════════════
+
 export PATH="/data/data/com.termux/files/usr/bin:$PATH"
 
-VERSION="1.1.1"
+VERSION="1.0.10_improved"
 GITHUB="https://raw.githubusercontent.com/marxlonvi/lonvi/refs/heads/main"
 
 CONFIG="$HOME/.dara"
 QUEUEFILE="$HOME/.dara_queue"
 PIDFILE="$HOME/.dara.pid"
+LOCKFILE="$HOME/.dara.lock"
 
 # Warna
 R='\033[0;31m'
@@ -25,137 +28,224 @@ AUTO_RAM_BOOST="no"
 RAM_BOOST_INTERVAL="60"
 
 RAMPIDFILE="$HOME/.dara_ramboost.pid"
+CACHE_PIDFILE="$HOME/.dara_cache.pid"
 
-# Paket yang TIDAK BOLEH di-kill (aman): sistem, launcher, termux, dan
-# apapun yang ada di antrian Roblox (biar tidak ikut tertutup oleh RAM booster)
+# Whitelist pattern untuk RAM booster
 RAM_BOOST_WHITELIST_PATTERN="^(com\.android\.|com\.google\.android\.(gms|gsf|inputmethod|packageinstaller)|com\.termux|android$|system$)"
 
-# ===== ROOT CHECK (cached, satu kali, dengan timeout) =====
-# Dulu setiap fitur yang butuh root (close all, cache clear, ram boost)
-# manggil `su -c ...` berkali-kali di dalam loop tanpa timeout. Kalau
-# popup izin root tidak langsung di-tap, Termux ke-block nunggu su selesai
-# -> keliatan "freeze", tidak bisa input, dan output numpuk pas akhirnya
-# lepas (menu jadi berantakan). Sekarang root dicek SEKALI di awal,
-# hasilnya di-cache, dan tiap su selalu dibungkus timeout.
-#
-# ALREADY_ROOT=1 kalau script ini SENDIRI sudah dijalankan sebagai root
-# (misal lewat `su -c "bash dara.sh"`). Dalam kondisi ini kita TIDAK
-# manggil `su` lagi (nested su dari proses yang sudah UID 0 bisa hang di
-# sebagian ROM/Magisk karena tidak ada TTY buat prompt ulang) -- command
-# privileged langsung dieksekusi saja karena kita memang sudah root.
+# Status cache
 ROOT_OK=0
 ALREADY_ROOT=0
-check_root() {
-    if [ "$(id -u 2>/dev/null)" = "0" ]; then
-        ALREADY_ROOT=1
-        ROOT_OK=1
-        return
-    fi
-
-    if command -v su >/dev/null 2>&1; then
-        if timeout 15 su -c 'echo ok' >/dev/null 2>&1; then
-            ROOT_OK=1
-        else
-            ROOT_OK=0
-        fi
-    else
-        ROOT_OK=0
-    fi
-}
-check_root
-
-# Jalankan command privileged: langsung eval kalau proses sudah root,
-# atau lewat `su -c` (dengan timeout) kalau perlu elevate dulu.
-run_privileged() {
-    local cmd="$1"
-    local tmo="${2:-8}"
-    if [ "$ALREADY_ROOT" -eq 1 ]; then
-        eval "$cmd" >/dev/null 2>&1
-    elif [ "$ROOT_OK" -eq 1 ]; then
-        timeout "$tmo" su -c "$cmd" >/dev/null 2>&1
-    fi
-}
-
-# Status cache (update tiap poll cycle, bukan setiap display)
 LAUNCHER_ACTIVE=0
 CACHE_ACTIVE=0
 RAMBOOST_ACTIVE=0
 QUEUE_COUNT=0
 declare -a QUEUE_PKGS=()
 
-# Background update check (non-blocking, silent)
-(curl -fsSL "$GITHUB/version.txt" 2>/dev/null | {
-    read remote
-    if [ -n "$remote" ] && [ "$remote" != "$VERSION" ]; then
-        tmpfile=$(mktemp)
-        curl -fsSL "$GITHUB/dara.sh" -o "$tmpfile" 2>/dev/null && \
-            chmod +x "$tmpfile" 2>/dev/null && \
-            mv "$tmpfile" "$0" 2>/dev/null && \
-            exec "$0"
-        rm -f "$tmpfile" 2>/dev/null
+# ═══════════════════════════════════════════════════════════════════════════
+# UTILITY FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════════════
+
+cleanup() {
+    rm -f "$LOCKFILE" 2>/dev/null
+}
+trap cleanup EXIT
+
+acquire_lock() {
+    local timeout=5
+    local elapsed=0
+    while [ -f "$LOCKFILE" ] && [ $elapsed -lt $timeout ]; do
+        sleep 0.2
+        elapsed=$((elapsed + 1))
+    done
+    touch "$LOCKFILE"
+}
+
+release_lock() {
+    rm -f "$LOCKFILE" 2>/dev/null
+}
+
+# Escape special characters untuk awk/sed
+escape_string() {
+    printf '%s\n' "$1" | sed 's:[&/\]:\\&:g'
+}
+
+log_debug() {
+    if [ -n "$DEBUG_MODE" ]; then
+        echo "[DEBUG] $*" >> "$HOME/.dara_debug.log"
     fi
-}) >/dev/null 2>&1 &
+}
+
+# Check root dengan timeout yang lebih robust
+check_root() {
+    if [ "$(id -u 2>/dev/null)" = "0" ]; then
+        ALREADY_ROOT=1
+        ROOT_OK=1
+        log_debug "Script running as root (UID 0)"
+        return
+    fi
+
+    if command -v su >/dev/null 2>&1; then
+        if timeout 15 su -c 'echo ok' >/dev/null 2>&1; then
+            ROOT_OK=1
+            log_debug "Root access available via su"
+        else
+            ROOT_OK=0
+            log_debug "Root access failed or timeout"
+        fi
+    else
+        ROOT_OK=0
+        log_debug "su command not found"
+    fi
+}
+
+# Run privileged command dengan better error handling
+run_privileged() {
+    local cmd="$1"
+    local tmo="${2:-8}"
+    
+    if [ -z "$cmd" ]; then
+        log_debug "run_privileged: empty command"
+        return 1
+    fi
+    
+    if [ "$ALREADY_ROOT" -eq 1 ]; then
+        eval "$cmd" 2>/dev/null
+        return $?
+    elif [ "$ROOT_OK" -eq 1 ]; then
+        timeout "$tmo" su -c "$cmd" 2>/dev/null
+        return $?
+    fi
+    
+    return 1
+}
+
+# Check if process exists safely
+is_process_running() {
+    local pkg="$1"
+    [ -z "$pkg" ] && return 1
+    pidof "$pkg" >/dev/null 2>&1
+}
+
+# Update status cache
+update_status_cache() {
+    LAUNCHER_ACTIVE=0
+    CACHE_ACTIVE=0
+    RAMBOOST_ACTIVE=0
+    
+    if [ -f "$PIDFILE" ] 2>/dev/null; then
+        local pid=$(cat "$PIDFILE" 2>/dev/null)
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            LAUNCHER_ACTIVE=1
+        fi
+    fi
+    
+    if [ -f "$CACHE_PIDFILE" ] 2>/dev/null; then
+        local pid=$(cat "$CACHE_PIDFILE" 2>/dev/null)
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            CACHE_ACTIVE=1
+        fi
+    fi
+
+    if [ -f "$RAMPIDFILE" ] 2>/dev/null; then
+        local pid=$(cat "$RAMPIDFILE" 2>/dev/null)
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            RAMBOOST_ACTIVE=1
+        fi
+    fi
+}
+
+# Auto-update check dengan better error handling
+check_for_updates() {
+    (
+        timeout 5 curl -fsSL "$GITHUB/version.txt" 2>/dev/null | {
+            read -r remote
+            if [ -z "$remote" ]; then
+                log_debug "Update check failed: empty response"
+                return
+            fi
+            
+            if [ "$remote" != "$VERSION" ]; then
+                tmpfile=$(mktemp 2>/dev/null)
+                if [ -z "$tmpfile" ]; then
+                    log_debug "Update check failed: cannot create temp file"
+                    return
+                fi
+                
+                if timeout 10 curl -fsSL "$GITHUB/dara.sh" -o "$tmpfile" 2>/dev/null && \
+                   [ -s "$tmpfile" ] && \
+                   chmod +x "$tmpfile" 2>/dev/null; then
+                    mv "$tmpfile" "$0" 2>/dev/null && exec "$0"
+                fi
+                rm -f "$tmpfile" 2>/dev/null
+            fi
+        }
+    ) >/dev/null 2>&1 &
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CONFIG MANAGEMENT
+# ═══════════════════════════════════════════════════════════════════════════
 
 save_config() {
+    acquire_lock
     cat > "$CONFIG" <<EOF
-PSLINK="$PSLINK"
+PSLINK="$(escape_string "$PSLINK")"
 AUTO_CLEAR_CACHE="$AUTO_CLEAR_CACHE"
 AUTO_RAM_BOOST="$AUTO_RAM_BOOST"
 RAM_BOOST_INTERVAL="$RAM_BOOST_INTERVAL"
 EOF
+    release_lock
 }
+
+load_config() {
+    if [ -f "$CONFIG" ]; then
+        # Source dengan error handling
+        if ! source "$CONFIG" 2>/dev/null; then
+            log_debug "Config load failed, using defaults"
+            PSLINK=""
+            AUTO_CLEAR_CACHE="yes"
+            AUTO_RAM_BOOST="no"
+            RAM_BOOST_INTERVAL="60"
+        fi
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# QUEUE MANAGEMENT
+# ═══════════════════════════════════════════════════════════════════════════
 
 load_queue_cache() {
     QUEUE_PKGS=()
     QUEUE_COUNT=0
-    [ -f "$QUEUEFILE" ] || return
-    while IFS='|' read -r pkg _ ; do
+    
+    if [ ! -f "$QUEUEFILE" ]; then
+        touch "$QUEUEFILE"
+        return
+    fi
+    
+    while IFS='|' read -r pkg delay; do
         [ -z "$pkg" ] && continue
         QUEUE_PKGS+=("$pkg")
         ((QUEUE_COUNT++))
     done < "$QUEUEFILE"
 }
 
-update_status_cache() {
-    # Cek launcher dan cache dalam satu operasi, bukan multiple test
-    LAUNCHER_ACTIVE=0
-    CACHE_ACTIVE=0
-    
-    if [ -f "$PIDFILE" ] 2>/dev/null && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
-        LAUNCHER_ACTIVE=1
-    fi
-    
-    if [ -f "$HOME/.dara_cache.pid" ] 2>/dev/null && kill -0 "$(cat "$HOME/.dara_cache.pid" 2>/dev/null)" 2>/dev/null; then
-        CACHE_ACTIVE=1
-    fi
-
-    RAMBOOST_ACTIVE=0
-    if [ -f "$RAMPIDFILE" ] 2>/dev/null && kill -0 "$(cat "$RAMPIDFILE" 2>/dev/null)" 2>/dev/null; then
-        RAMBOOST_ACTIVE=1
-    fi
-}
-
-[ -f "$CONFIG" ] && source "$CONFIG"
-[ -f "$QUEUEFILE" ] || touch "$QUEUEFILE"
-
-# Load initial cache
-load_queue_cache
-update_status_cache
-
 view_queue() {
     clear
-    echo "===== DAFTAR ROBLOX (ANTRIAN LAUNCHER ROBLOX) ====="
+    echo "===== DAFTAR ANTRIAN ROBLOX ====="
+    
     if [ "$QUEUE_COUNT" -eq 0 ]; then
-        echo "(kosong)"
+        echo "(antrian kosong)"
     else
         local i=0
         while IFS='|' read -r pkg delay; do
             [ -z "$pkg" ] && continue
             ((i++))
-            if pidof "$pkg" >/dev/null 2>&1; then
-                echo -e "    $i. ${G}●${W} $pkg  (delay: ${delay}s)"
+            if is_process_running "$pkg"; then
+                echo -e "    $i. ${G}●${W} $pkg (delay: ${delay}s)"
             else
-                echo -e "    $i. ${R}●${W} $pkg  (delay: ${delay}s)"
+                echo -e "    $i. ${R}●${W} $pkg (delay: ${delay}s)"
             fi
         done < "$QUEUEFILE"
     fi
@@ -163,14 +253,33 @@ view_queue() {
 }
 
 add_to_queue() {
-    mapfile -t APPS < <(pm list packages 2>/dev/null | sed 's/package://' | grep -i roblox)
+    clear
     
-    if [ ${#APPS[@]} -eq 0 ]; then
-        echo "Roblox tidak ditemukan."
+    # Scan Roblox packages dengan error handling
+    local apps_tmp=$(mktemp 2>/dev/null)
+    if [ -z "$apps_tmp" ]; then
+        echo "Gagal membuat temp file"
         read -p "Enter..."
         return
     fi
-
+    
+    if ! pm list packages 2>/dev/null | sed 's/package://' | grep -i roblox > "$apps_tmp"; then
+        echo "Gagal scan aplikasi Roblox"
+        rm -f "$apps_tmp"
+        read -p "Enter..."
+        return
+    fi
+    
+    if [ ! -s "$apps_tmp" ]; then
+        echo "Roblox tidak ditemukan."
+        rm -f "$apps_tmp"
+        read -p "Enter..."
+        return
+    fi
+    
+    mapfile -t APPS < "$apps_tmp"
+    rm -f "$apps_tmp"
+    
     clear
     echo "===== TAMBAH ROBLOX KE ANTRIAN ====="
     local i=0
@@ -178,16 +287,17 @@ add_to_queue() {
         echo "$((++i)). $app"
     done
     echo
-    read -p "Pilih nomor (bisa lebih dari satu, pisahkan spasi, misal: 1 2 3 4): " pilih_input
+    read -p "Pilih nomor (pisahkan spasi, misal: 1 2 3): " pilih_input
 
     declare -a chosen=()
     for p in $pilih_input; do
         if [[ "$p" =~ ^[0-9]+$ ]] && [ "$p" -ge 1 ] && [ "$p" -le "${#APPS[@]}" ]; then
-            local dup=0
+            # Cek duplikat
+            local is_dup=0
             for c in "${chosen[@]}"; do
-                [ "$c" = "$p" ] && dup=1 && break
+                [ "$c" = "$p" ] && is_dup=1 && break
             done
-            [ "$dup" -eq 0 ] && chosen+=("$p")
+            [ "$is_dup" -eq 0 ] && chosen+=("$p")
         fi
     done
 
@@ -197,19 +307,29 @@ add_to_queue() {
         return
     fi
 
-    read -p "Pilih delay (default 50): " delay
+    read -p "Delay antar aplikasi (detik, default 50): " delay
     delay="${delay:-50}"
-    while [[ ! "$delay" =~ ^[0-9]+$ ]]; do
-        read -p "Delay harus angka, coba lagi (default 50): " delay
+    
+    # Validasi delay
+    while [[ ! "$delay" =~ ^[0-9]+$ ]] || [ "$delay" -lt 1 ] || [ "$delay" -gt 3600 ]; do
+        read -p "Delay harus angka 1-3600 detik, coba lagi (default 50): " delay
         delay="${delay:-50}"
     done
 
     echo
+    acquire_lock
     for p in "${chosen[@]}"; do
         local pkg="${APPS[$((p-1))]}"
-        echo "${pkg}|${delay}" >> "$QUEUEFILE"
-        echo "Ditambahkan: $pkg (delay ${delay}s)"
+        
+        # Cek duplikat di queue
+        if grep -q "^$(escape_string "$pkg")|" "$QUEUEFILE"; then
+            echo "Sudah ada: $pkg"
+        else
+            printf "%s|%s\n" "$pkg" "$delay" >> "$QUEUEFILE"
+            echo "Ditambahkan: $pkg (delay ${delay}s)"
+        fi
     done
+    release_lock
 
     load_queue_cache
     read -p "Enter..."
@@ -220,7 +340,7 @@ remove_from_queue() {
     
     [ "$QUEUE_COUNT" -eq 0 ] && read -p "Enter..." && return
     
-    read -p "Hapus nomor berapa? (pisahkan spasi utk banyak, 'all' utk semua, 0 batal): " pilih_input
+    read -p "Hapus nomor (pisahkan spasi, 'all' hapus semua, 0 batal): " pilih_input
 
     if [ "$pilih_input" = "0" ]; then
         echo "Dibatalkan."
@@ -229,7 +349,9 @@ remove_from_queue() {
     fi
 
     if [[ "$pilih_input" =~ ^([Aa][Ll][Ll])$ ]]; then
+        acquire_lock
         > "$QUEUEFILE"
+        release_lock
         load_queue_cache
         echo "Semua antrian dihapus."
         read -p "Enter..."
@@ -239,26 +361,28 @@ remove_from_queue() {
     declare -a nums=()
     for p in $pilih_input; do
         if [[ "$p" =~ ^[0-9]+$ ]] && [ "$p" -ge 1 ] && [ "$p" -le "$QUEUE_COUNT" ]; then
-            local dup=0
+            local is_dup=0
             for c in "${nums[@]}"; do
-                [ "$c" = "$p" ] && dup=1 && break
+                [ "$c" = "$p" ] && is_dup=1 && break
             done
-            [ "$dup" -eq 0 ] && nums+=("$p")
+            [ "$is_dup" -eq 0 ] && nums+=("$p")
         fi
     done
 
     if [ ${#nums[@]} -eq 0 ]; then
-        echo "Tidak ada nomor valid / dibatalkan."
+        echo "Nomor tidak valid."
         read -p "Enter..."
         return
     fi
 
-    # Urutkan descending supaya nomor baris tidak bergeser saat dihapus satu-satu
+    # Sort descending untuk prevent index shift saat delete
     IFS=$'\n' nums=($(sort -rn <<<"${nums[*]}")); unset IFS
 
+    acquire_lock
     for n in "${nums[@]}"; do
         sed -i "${n}d" "$QUEUEFILE"
     done
+    release_lock
 
     load_queue_cache
     echo "Dihapus ${#nums[@]} entri dari antrian."
@@ -289,15 +413,31 @@ manage_queue() {
     done
 }
 
+# ═══════════════════════════════════════════════════════════════════════════
+# LAUNCHER FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════════════
+
 launch_package() {
     local pkg="$1"
     
+    [ -z "$pkg" ] && return 1
+    
+    log_debug "Launching package: $pkg"
+    
+    # Coba dengan PSLINK dulu (jika ada)
     if [ -n "$PSLINK" ]; then
-        am start -a android.intent.action.VIEW -d "$PSLINK" -p "$pkg" >/dev/null 2>&1 && return
+        timeout 5 am start -a android.intent.action.VIEW -d "$PSLINK" -n "$(cmd package resolve-activity --brief "$pkg" 2>/dev/null | tail -n 1)" >/dev/null 2>&1 && return 0
     fi
     
-    am start -n "$(cmd package resolve-activity --brief "$pkg" 2>/dev/null | tail -n 1)" >/dev/null 2>&1 \
-        || monkey -p "$pkg" -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1
+    # Fallback: launch biasa dengan resolve-activity
+    local activity=$(cmd package resolve-activity --brief "$pkg" 2>/dev/null | tail -n 1)
+    if [ -n "$activity" ]; then
+        timeout 5 am start -n "$activity" >/dev/null 2>&1 && return 0
+    fi
+    
+    # Last resort: monkey (deprecated tapi still works sometimes)
+    timeout 5 monkey -p "$pkg" -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1
+    return $?
 }
 
 launch_sequence() {
@@ -307,12 +447,13 @@ launch_sequence() {
     
     while IFS='|' read -r pkg delay; do
         [ -z "$pkg" ] && continue
+        log_debug "Sequence: launching $pkg with delay $delay"
         launch_package "$pkg"
-        sleep "$delay"
+        [ -n "$delay" ] && sleep "$delay"
     done < "$QUEUEFILE"
 }
 
-# Launcher loop yang lebih hemat: single pidof call untuk semua package
+# Launcher loop dengan perbaikan
 launcher_loop() {
     while true; do
         if [ ! -s "$QUEUEFILE" ]; then
@@ -320,16 +461,24 @@ launcher_loop() {
             continue
         fi
 
-        # Single pidof untuk semua package, bandingkan jumlah proses
+        # Baca semua package dari queue
         local pkgs=($(cut -d'|' -f1 "$QUEUEFILE" 2>/dev/null | grep -v '^$'))
         local total=${#pkgs[@]}
         
         if [ "$total" -gt 0 ]; then
-            local running=$(pidof "${pkgs[@]}" 2>/dev/null | wc -w)
+            # Check berapa banyak yang running
+            local running=0
+            for pkg in "${pkgs[@]}"; do
+                is_process_running "$pkg" && ((running++))
+            done
+            
+            log_debug "Launcher check: $running/$total running"
+            
+            # Jika ada yang tertutup, relaunch
             if [ "$running" -lt "$total" ]; then
                 if command -v termux-notification >/dev/null 2>&1; then
                     termux-notification --id dara_launcher --title "DARA Auto-Launcher" \
-                        --content "Ada Roblox yang tertutup, menjalankan ulang antrian..." 2>/dev/null
+                        --content "Ada Roblox yang tertutup, menjalankan ulang..." 2>/dev/null
                 fi
                 launch_sequence
             fi
@@ -339,9 +488,81 @@ launcher_loop() {
     done
 }
 
+start_launcher() {
+    [ ! -s "$QUEUEFILE" ] && echo "Antrian Roblox masih kosong." && sleep 2 && return
+    
+    if [ -f "$PIDFILE" ]; then
+        local pid=$(cat "$PIDFILE" 2>/dev/null)
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            echo "Auto-Launcher Roblox sudah berjalan."
+            sleep 2
+            return
+        fi
+    fi
+
+    nohup bash -c "
+        export PATH='/data/data/com.termux/files/usr/bin:\$PATH'
+        QUEUEFILE='$(escape_string "$QUEUEFILE")'
+        PSLINK='$(escape_string "$PSLINK")'
+        $(declare -f launch_package)
+        $(declare -f launch_sequence)
+        $(declare -f launcher_loop)
+        $(declare -f log_debug)
+        $(declare -f is_process_running)
+        launcher_loop
+    " >/dev/null 2>&1 &
+    
+    local new_pid=$!
+    echo "$new_pid" > "$PIDFILE"
+    
+    echo "Auto-Launcher Roblox dimulai (PID: $new_pid)"
+    sleep 2
+}
+
+stop_launcher() {
+    if [ -f "$PIDFILE" ]; then
+        local pid=$(cat "$PIDFILE" 2>/dev/null)
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null
+            sleep 1
+            kill -9 "$pid" 2>/dev/null
+        fi
+        rm -f "$PIDFILE"
+        
+        if command -v termux-notification-remove >/dev/null 2>&1; then
+            termux-notification-remove dara_launcher 2>/dev/null
+        fi
+        
+        echo "Auto-Launcher Roblox dihentikan."
+    else
+        echo "Auto-Launcher Roblox tidak berjalan."
+    fi
+    sleep 2
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ROBLOX CONTROL
+# ═══════════════════════════════════════════════════════════════════════════
+
 close_all_roblox() {
     clear
-    mapfile -t ALL_ROBLOX < <(pm list packages 2>/dev/null | sed 's/package://' | grep -i roblox)
+    
+    local apps_tmp=$(mktemp 2>/dev/null)
+    if [ -z "$apps_tmp" ]; then
+        echo "Gagal membuat temp file"
+        sleep 2
+        return
+    fi
+    
+    if ! pm list packages 2>/dev/null | sed 's/package://' | grep -i roblox > "$apps_tmp"; then
+        echo "Gagal scan aplikasi Roblox"
+        rm -f "$apps_tmp"
+        sleep 2
+        return
+    fi
+    
+    mapfile -t ALL_ROBLOX < "$apps_tmp"
+    rm -f "$apps_tmp"
 
     if [ ${#ALL_ROBLOX[@]} -eq 0 ]; then
         echo "Tidak ada Roblox terpasang di device."
@@ -349,53 +570,37 @@ close_all_roblox() {
         return
     fi
 
-    # Matikan launcher dulu supaya tidak auto-relaunch pas kita force-stop
-    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
-        kill "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null
-        rm -f "$PIDFILE"
-    fi
-
-    # Kalau root belum kedeteksi (misal popup izin belum ke-tap saat startup),
-    # coba cek ulang sekarang sebelum eksekusi. am force-stop ke package LAIN
-    # butuh izin sistem dan akan gagal diam-diam tanpa root.
-    if [ "$ROOT_OK" -ne 1 ] && [ "$ALREADY_ROOT" -ne 1 ]; then
-        check_root
+    # Stop launcher dulu supaya tidak auto-relaunch
+    if [ -f "$PIDFILE" ]; then
+        local pid=$(cat "$PIDFILE" 2>/dev/null)
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null
+            rm -f "$PIDFILE"
+        fi
     fi
 
     echo "Menutup paksa ${#ALL_ROBLOX[@]} Roblox..."
-    [ "$ROOT_OK" -ne 1 ] && [ "$ALREADY_ROOT" -ne 1 ] && \
-        echo -e "${R}Peringatan: root tidak terdeteksi, force-stop ke app lain kemungkinan tidak akan berfungsi.${W}"
-
-    # Non-root: force-stop biasa per package (cepat, tidak butuh su, tapi
-    # biasanya tidak berefek ke package lain tanpa izin sistem/root)
+    
+    # Non-root attempt
     for pkg in "${ALL_ROBLOX[@]}"; do
-        am force-stop "$pkg" >/dev/null 2>&1
+        timeout 3 am force-stop "$pkg" >/dev/null 2>&1
     done
 
-    # Root (kalau ada): SATU panggilan privileged untuk semua package
-    # sekaligus (bukan loop per-package), dibungkus timeout. pkill/kill
-    # dijalankan DI DALAM sesi su supaya bisa lihat & bunuh proses app lain
-    # (pidof dari sisi non-root sering gagal baca proses app lain di
-    # Android modern karena dibatasi SELinux/hidepid).
+    # Root attempt (jika tersedia)
     if [ "$ROOT_OK" -eq 1 ]; then
         local su_cmd=""
         for pkg in "${ALL_ROBLOX[@]}"; do
             su_cmd+="am force-stop $pkg; pkill -9 -f $pkg; "
         done
-        run_privileged "$su_cmd" 12
+        [ -n "$su_cmd" ] && run_privileged "$su_cmd" 12
     fi
-    # Sisa proses yang masih hidup tanpa root, kill langsung (best effort)
-    for pkg in "${ALL_ROBLOX[@]}"; do
-        pid=$(pidof "$pkg" 2>/dev/null)
-        [ -n "$pid" ] && kill -9 $pid >/dev/null 2>&1
-    done
 
-    sleep 1
+    sleep 2
 
-    # Verifikasi hasil
+    # Verifikasi
     local masih_aktif=0
     for pkg in "${ALL_ROBLOX[@]}"; do
-        if pidof "$pkg" >/dev/null 2>&1; then
+        if is_process_running "$pkg"; then
             masih_aktif=$((masih_aktif+1))
             echo -e "   ${R}●${W} $pkg masih aktif"
         fi
@@ -404,54 +609,29 @@ close_all_roblox() {
     if [ "$masih_aktif" -eq 0 ]; then
         echo "Semua Roblox berhasil ditutup paksa."
     else
-        echo "$masih_aktif Roblox masih belum mati (mungkin butuh akses root/su untuk paksa penuh)."
+        echo "$masih_aktif Roblox masih aktif (butuh root untuk close penuh)."
     fi
 
     sleep 2
 }
 
-start_launcher() {
-    [ ! -s "$QUEUEFILE" ] && echo "Antrian Roblox masih kosong." && sleep 2 && return
-    
-    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
-        echo "Auto-Launcher Roblox sudah berjalan."
-        sleep 2
+open_selected_roblox() {
+    local apps_tmp=$(mktemp 2>/dev/null)
+    if [ -z "$apps_tmp" ]; then
+        echo "Gagal membuat temp file"
+        read -p "Enter..."
         return
     fi
-
-    nohup bash -c "
-        QUEUEFILE='$QUEUEFILE'; PSLINK='$PSLINK'
-        $(declare -f launch_package)
-        $(declare -f launch_sequence)
-        $(declare -f launcher_loop)
-        launcher_loop
-    " >/dev/null 2>&1 &
-    echo $! > "$PIDFILE"
     
-    echo "Auto-Launcher Roblox dimulai di background."
-    sleep 2
-}
-
-stop_launcher() {
-    if [ -f "$PIDFILE" ]; then
-        kill "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null
-        rm -f "$PIDFILE"
-        if command -v termux-notification-remove >/dev/null 2>&1; then
-            termux-notification-remove dara_launcher 2>/dev/null
-        fi
-        echo "Auto-Launcher Roblox dihentikan."
-    else
-        echo "Auto-Launcher Roblox tidak berjalan."
+    if ! pm list packages 2>/dev/null | sed 's/package://' | grep -i roblox > "$apps_tmp"; then
+        echo "Gagal scan aplikasi Roblox"
+        rm -f "$apps_tmp"
+        read -p "Enter..."
+        return
     fi
-    sleep 2
-}
-
-# Buka satu Roblox pilihan (dari SEMUA package Roblox yang terpasang, bukan
-# cuma yang ada di antrian). Kalau app-nya masih tertutup -> langsung buka +
-# masuk PS link. Kalau app-nya sudah aktif/terbuka -> force-close dulu baru
-# buka ulang + masuk PS link (fresh join).
-open_selected_roblox() {
-    mapfile -t APPS < <(pm list packages 2>/dev/null | sed 's/package://' | grep -i roblox)
+    
+    mapfile -t APPS < "$apps_tmp"
+    rm -f "$apps_tmp"
 
     if [ ${#APPS[@]} -eq 0 ]; then
         echo "Roblox tidak ditemukan."
@@ -464,7 +644,7 @@ open_selected_roblox() {
     local i=0
     for app in "${APPS[@]}"; do
         ((i++))
-        if pidof "$app" >/dev/null 2>&1; then
+        if is_process_running "$app"; then
             echo -e "$i. ${G}●${W} $app"
         else
             echo -e "$i. ${R}●${W} $app"
@@ -481,35 +661,46 @@ open_selected_roblox() {
 
     local pkg="${APPS[$((pilih-1))]}"
 
-    if pidof "$pkg" >/dev/null 2>&1; then
-        echo "$pkg sedang aktif, menutup dulu lalu membuka ulang..."
-        am force-stop "$pkg" >/dev/null 2>&1
+    if is_process_running "$pkg"; then
+        echo "$pkg sedang aktif, menutup dulu..."
+        timeout 3 am force-stop "$pkg" >/dev/null 2>&1
         sleep 1
     else
         echo "$pkg masih tertutup, membuka..."
     fi
 
-    launch_package "$pkg"
-    echo "Selesai: $pkg dibuka."
+    if launch_package "$pkg"; then
+        echo "Selesai: $pkg dibuka."
+    else
+        echo "Gagal membuka $pkg"
+    fi
+    
     read -p "Enter..."
 }
 
-# Cache clear dengan lazy initialization dan exponential backoff
+# ═══════════════════════════════════════════════════════════════════════════
+# CACHE & RAM MANAGEMENT
+# ═══════════════════════════════════════════════════════════════════════════
+
 clear_cache_all() {
     [ ! -s "$QUEUEFILE" ] && return
-    [ "$ROOT_OK" -ne 1 ] && return
+    [ "$ROOT_OK" -ne 1 ] && [ "$ALREADY_ROOT" -ne 1 ] && return
 
-    local su_cmd=""
+    local cleared=0
     while IFS='|' read -r pkg _; do
         [ -z "$pkg" ] && continue
-        su_cmd+="rm -rf /data/data/$pkg/cache/* 2>/dev/null; "
+        if [ "$ALREADY_ROOT" -eq 1 ]; then
+            rm -rf "/data/data/$pkg/cache/"* 2>/dev/null && ((cleared++))
+        else
+            timeout 3 su -c "rm -rf /data/data/$pkg/cache/* 2>/dev/null" 2>/dev/null && ((cleared++))
+        fi
     done < "$QUEUEFILE"
 
-    [ -n "$su_cmd" ] && run_privileged "$su_cmd" 15
+    log_debug "Cache cleared for $cleared packages"
 
     if command -v termux-notification >/dev/null 2>&1; then
         termux-notification --id dara_cache --title "DARA Auto Clear Cache" \
-            --content "Cache semua Roblox di antrian sudah dibersihkan." 2>/dev/null
+            --content "Cache $cleared Roblox dibersihkan." 2>/dev/null
     fi
 }
 
@@ -524,42 +715,51 @@ clear_cache_loop() {
 }
 
 cache_clear_running() {
-    [ -f "$HOME/.dara_cache.pid" ] && kill -0 "$(cat "$HOME/.dara_cache.pid" 2>/dev/null)" 2>/dev/null
+    if [ -f "$CACHE_PIDFILE" ]; then
+        local pid=$(cat "$CACHE_PIDFILE" 2>/dev/null)
+        [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+        return $?
+    fi
+    return 1
 }
 
 enable_cache_clear() {
     cache_clear_running && return
     
     nohup bash -c "
-        QUEUEFILE='$QUEUEFILE'
+        export PATH='/data/data/com.termux/files/usr/bin:\$PATH'
+        QUEUEFILE='$(escape_string "$QUEUEFILE")'
         ROOT_OK='$ROOT_OK'
         ALREADY_ROOT='$ALREADY_ROOT'
         $(declare -f run_privileged)
         $(declare -f clear_cache_all)
         $(declare -f clear_cache_loop)
+        $(declare -f log_debug)
         clear_cache_loop
     " >/dev/null 2>&1 &
-    echo $! > "$HOME/.dara_cache.pid"
+    
+    echo $! > "$CACHE_PIDFILE"
 }
 
 disable_cache_clear() {
-    if [ -f "$HOME/.dara_cache.pid" ]; then
-        kill "$(cat "$HOME/.dara_cache.pid" 2>/dev/null)" 2>/dev/null
-        rm -f "$HOME/.dara_cache.pid"
+    if [ -f "$CACHE_PIDFILE" ]; then
+        local pid=$(cat "$CACHE_PIDFILE" 2>/dev/null)
+        if [ -n "$pid" ]; then
+            kill "$pid" 2>/dev/null
+            sleep 1
+            kill -9 "$pid" 2>/dev/null
+        fi
+        rm -f "$CACHE_PIDFILE"
     fi
+    
     if command -v termux-notification-remove >/dev/null 2>&1; then
         termux-notification-remove dara_cache 2>/dev/null
     fi
 }
 
-# ===== RAM BOOSTER =====
-# Kill aplikasi pihak ketiga yang berjalan di latar belakang dan aman
-# untuk dimatikan (bukan sistem, bukan Termux, bukan Roblox yang lagi
-# di-launch/di-antrian). Tujuannya membebaskan RAM tanpa mengganggu
-# proses penting.
 ram_boost_once() {
-    # Kumpulkan package yang harus dilindungi (whitelist dinamis: isi antrian)
     declare -A PROTECT=()
+    
     if [ -s "$QUEUEFILE" ]; then
         while IFS='|' read -r pkg _; do
             [ -z "$pkg" ] && continue
@@ -567,42 +767,41 @@ ram_boost_once() {
         done < "$QUEUEFILE"
     fi
 
-    # Ambil semua package pihak ketiga (bukan sistem) yang PROSESNYA aktif
     local killed=0
-    local pkg
     local su_cmd=""
+    
     while read -r pkg; do
         [ -z "$pkg" ] && continue
 
-        # Lewati kalau masuk whitelist statis (sistem/termux/dara sendiri)
+        # Skip whitelist statis
         [[ "$pkg" =~ $RAM_BOOST_WHITELIST_PATTERN ]] && continue
 
-        # Lewati kalau ada di antrian Roblox (biar tidak mati saat lagi dipakai)
+        # Skip dynamic whitelist (antrian)
         [ -n "${PROTECT[$pkg]}" ] && continue
 
-        # Cuma proses yang benar-benar jalan di background
-        if pidof "$pkg" >/dev/null 2>&1; then
-            am force-stop "$pkg" >/dev/null 2>&1
+        # Cek proses running
+        if is_process_running "$pkg"; then
+            timeout 2 am force-stop "$pkg" >/dev/null 2>&1
             [ "$ROOT_OK" -eq 1 ] && su_cmd+="am force-stop $pkg; "
-            killed=$((killed+1))
+            ((killed++))
         fi
     done < <(pm list packages -3 2>/dev/null | sed 's/package://')
 
-    # Satu panggilan su untuk semua package, dibungkus timeout (bukan
-    # loop per-package) supaya tidak pernah menggantung nunggu popup izin.
     if [ "$ROOT_OK" -eq 1 ] && [ -n "$su_cmd" ]; then
         run_privileged "$su_cmd" 8
     fi
 
     if [ "$killed" -gt 0 ] && command -v termux-notification >/dev/null 2>&1; then
         termux-notification --id dara_ramboost --title "DARA RAM Booster" \
-            --content "$killed aplikasi latar belakang ditutup untuk membebaskan RAM." 2>/dev/null
+            --content "$killed aplikasi background ditutup, RAM terbebas." 2>/dev/null
     fi
+    
+    log_debug "RAM boost killed $killed apps"
 }
 
 ram_boost_loop() {
     local interval="$1"
-    [[ "$interval" =~ ^[0-9]+$ ]] || interval=60
+    [[ ! "$interval" =~ ^[0-9]+$ ]] && interval=60
     [ "$interval" -lt 5 ] && interval=5
 
     while true; do
@@ -612,7 +811,12 @@ ram_boost_loop() {
 }
 
 ram_boost_running() {
-    [ -f "$RAMPIDFILE" ] && kill -0 "$(cat "$RAMPIDFILE" 2>/dev/null)" 2>/dev/null
+    if [ -f "$RAMPIDFILE" ]; then
+        local pid=$(cat "$RAMPIDFILE" 2>/dev/null)
+        [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+        return $?
+    fi
+    return 1
 }
 
 enable_ram_boost() {
@@ -620,56 +824,36 @@ enable_ram_boost() {
     ram_boost_running && return
 
     nohup bash -c "
-        QUEUEFILE='$QUEUEFILE'
-        RAM_BOOST_WHITELIST_PATTERN='$RAM_BOOST_WHITELIST_PATTERN'
+        export PATH='/data/data/com.termux/files/usr/bin:\$PATH'
+        QUEUEFILE='$(escape_string "$QUEUEFILE")'
+        RAM_BOOST_WHITELIST_PATTERN='$(escape_string "$RAM_BOOST_WHITELIST_PATTERN")'
         ROOT_OK='$ROOT_OK'
         ALREADY_ROOT='$ALREADY_ROOT'
         $(declare -f run_privileged)
         $(declare -f ram_boost_once)
         $(declare -f ram_boost_loop)
+        $(declare -f is_process_running)
+        $(declare -f log_debug)
         ram_boost_loop '$interval'
     " >/dev/null 2>&1 &
+    
     echo $! > "$RAMPIDFILE"
 }
 
 disable_ram_boost() {
     if [ -f "$RAMPIDFILE" ]; then
-        kill "$(cat "$RAMPIDFILE" 2>/dev/null)" 2>/dev/null
+        local pid=$(cat "$RAMPIDFILE" 2>/dev/null)
+        if [ -n "$pid" ]; then
+            kill "$pid" 2>/dev/null
+            sleep 1
+            kill -9 "$pid" 2>/dev/null
+        fi
         rm -f "$RAMPIDFILE"
     fi
+    
     if command -v termux-notification-remove >/dev/null 2>&1; then
         termux-notification-remove dara_ramboost 2>/dev/null
     fi
-}
-
-toggle_ram_boost() {
-    read -p "Aktifkan RAM Booster (kill app latar belakang otomatis)? (Y/n): " ans
-    ans="${ans:-Y}"
-
-    case "$ans" in
-        [Yy]*)
-            read -p "Interval kill (detik, default 60, min 5): " iv
-            iv="${iv:-60}"
-            while [[ ! "$iv" =~ ^[0-9]+$ ]] || [ "$iv" -lt 5 ]; do
-                read -p "Interval harus angka >= 5, coba lagi (default 60): " iv
-                iv="${iv:-60}"
-            done
-            RAM_BOOST_INTERVAL="$iv"
-            AUTO_RAM_BOOST="yes"
-            save_config
-            disable_ram_boost
-            enable_ram_boost "$iv"
-            echo "RAM Booster diaktifkan, kill app background tiap ${iv} detik."
-            ;;
-        [Nn]*)
-            AUTO_RAM_BOOST="no"
-            save_config
-            disable_ram_boost
-            echo "RAM Booster dimatikan."
-            ;;
-    esac
-
-    sleep 2
 }
 
 toggle_cache_clear() {
@@ -683,7 +867,7 @@ toggle_cache_clear() {
             AUTO_CLEAR_CACHE="yes"
             save_config
             enable_cache_clear
-            echo "Auto Clear Cache diaktifkan (pembersihan pertama dalam 20 menit, lalu tiap 2 jam)."
+            echo "Auto Clear Cache diaktifkan (pembersihan pertama dalam 20 menit)."
             ;;
         [Nn]*)
             AUTO_CLEAR_CACHE="no"
@@ -696,21 +880,63 @@ toggle_cache_clear() {
     sleep 2
 }
 
-# Auto-enable cache clear kalau setting ada
+toggle_ram_boost() {
+    read -p "Aktifkan RAM Booster (kill app background)? (Y/n): " ans
+    ans="${ans:-Y}"
+
+    case "$ans" in
+        [Yy]*)
+            read -p "Interval kill (detik, default 60, min 5): " iv
+            iv="${iv:-60}"
+            while [[ ! "$iv" =~ ^[0-9]+$ ]] || [ "$iv" -lt 5 ]; then
+                read -p "Interval 1-3600 detik, coba lagi (default 60): " iv
+                iv="${iv:-60}"
+            done
+            RAM_BOOST_INTERVAL="$iv"
+            AUTO_RAM_BOOST="yes"
+            save_config
+            disable_ram_boost
+            enable_ram_boost "$iv"
+            echo "RAM Booster diaktifkan (kill setiap ${iv}s)."
+            ;;
+        [Nn]*)
+            AUTO_RAM_BOOST="no"
+            save_config
+            disable_ram_boost
+            echo "RAM Booster dimatikan."
+            ;;
+    esac
+
+    sleep 2
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# INITIALIZATION
+# ═══════════════════════════════════════════════════════════════════════════
+
+check_root
+load_config
+load_queue_cache
+update_status_cache
+check_for_updates
+
+# Auto-enable features sesuai config
 if [ "$AUTO_CLEAR_CACHE" = "yes" ] && [ -s "$QUEUEFILE" ] && ! cache_clear_running; then
     enable_cache_clear &
 fi
 
-# Auto-enable ram booster kalau setting ada
 if [ "$AUTO_RAM_BOOST" = "yes" ] && ! ram_boost_running; then
     enable_ram_boost "$RAM_BOOST_INTERVAL" &
 fi
 
-# Main loop dengan optimized status display (cached status, bukan multiple tests)
+# ═══════════════════════════════════════════════════════════════════════════
+# MAIN MENU LOOP
+# ═══════════════════════════════════════════════════════════════════════════
+
 while true; do
     clear
     echo -e "${Y}╔══════════════════════════╗${W}"
-    echo -e "${Y}║${C}       DARA v$VERSION        ${Y}║${W}"
+    echo -e "${Y}║${C}    DARA v$VERSION     ${Y}║${W}"
     echo -e "${Y}╠══════════════════════════╣${W}"
     echo -e "${Y}║${W} 1. Masukkan Link PS      ${Y}║${W}"
     echo -e "${Y}║${W} 2. Kelola Antrian Roblox ${Y}║${W}"
@@ -725,17 +951,17 @@ while true; do
     echo -e "${Y}╚══════════════════════════╝${W}"
     echo
 
-    # Update status cache sebelum display
+    # Update status display
     update_status_cache
     
     echo -e "${C}Root      :${W} $([ "$ROOT_OK" -eq 1 ] && echo "${G}● TERDETEKSI${W}" || echo "${R}● TIDAK TERDETEKSI${W}")"
     echo -e "${C}Link PS   :${W} ${PSLINK:-Belum diatur}"
-    echo -e "${C}Antrian   :${W} $QUEUE_COUNT Roblox terdaftar"
+    echo -e "${C}Antrian   :${W} $QUEUE_COUNT Roblox"
 
     if [ "$QUEUE_COUNT" -gt 0 ] && [ -s "$QUEUEFILE" ]; then
         while IFS='|' read -r pkg delay; do
             [ -z "$pkg" ] && continue
-            if pidof "$pkg" >/dev/null 2>&1; then
+            if is_process_running "$pkg"; then
                 echo -e "   ${G}●${W} $pkg (delay ${delay}s)"
             else
                 echo -e "   ${R}●${W} $pkg (delay ${delay}s)"
@@ -744,15 +970,15 @@ while true; do
     fi
 
     echo -e "${C}Launcher   :${W} $([ "$LAUNCHER_ACTIVE" -eq 1 ] && echo "${G}● AKTIF${W}" || echo "${R}● TIDAK AKTIF${W}")"
-    echo -e "${C}Clear Cache:${W} $([ "$CACHE_ACTIVE" -eq 1 ] && echo "${G}● AKTIF${W} (tiap 2 jam, root)" || echo "${R}● TIDAK AKTIF${W}")"
-    echo -e "${C}RAM Booster:${W} $([ "$RAMBOOST_ACTIVE" -eq 1 ] && echo "${G}● AKTIF${W} (tiap ${RAM_BOOST_INTERVAL}s)" || echo "${R}● TIDAK AKTIF${W}")"
+    echo -e "${C}Clear Cache:${W} $([ "$CACHE_ACTIVE" -eq 1 ] && echo "${G}● AKTIF${W} (root)" || echo "${R}● TIDAK AKTIF${W}")"
+    echo -e "${C}RAM Booster:${W} $([ "$RAMBOOST_ACTIVE" -eq 1 ] && echo "${G}● AKTIF${W}" || echo "${R}● TIDAK AKTIF${W}")"
     echo
 
     read -p "Pilih: " menu
 
     case "$menu" in
         1)
-            read -p "Link PS: " PSLINK
+            read -p "Link PS (PSLINK): " PSLINK
             save_config
             ;;
         2)
@@ -784,6 +1010,7 @@ while true; do
             stop_launcher
             disable_cache_clear
             disable_ram_boost
+            echo "Closing DARA..."
             exit 0
             ;;
     esac
