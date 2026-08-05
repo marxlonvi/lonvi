@@ -27,7 +27,7 @@ if [ "$(id -u 2>/dev/null)" != "0" ] && [ -z "$DARA_ELEVATED" ]; then
     fi
 fi
 
-VERSION="1.1.2"
+VERSION="1.1.4"
 GITHUB="https://raw.githubusercontent.com/marxlonvi/lonvi/refs/heads/main"
 
 CONFIG="$HOME/.dara"
