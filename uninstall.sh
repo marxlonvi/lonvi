@@ -45,7 +45,6 @@ com.android.vpndialogs
 com.android.wallpaper.livepicker
 com.android.wallpaperbackup
 com.baidu.cloud.service
-com.google.android.gsf.login
 com.wshl.file.observerservice
 com.android.backupconfirm
 com.android.captiveportallogin
@@ -120,8 +119,8 @@ com.android.carrierconfig
 com.android.contacts
 com.android.dialer
 com.android.email
-com.android.settings.intelligence
 com.android.bluetooth
+com.google.android.inputmethod.latin
 EOF
 
 pause() {
@@ -152,6 +151,7 @@ manual_uninstall() {
       echo "$i. $line"
     done < "$TMPLIST"
     echo "========================================="
+    echo "Pilih angka aplikasi yang ingin diuninstall dari daftar di atas."
     echo "Tips: nomor dipisah spasi (contoh: 3 6 8)"
     echo "Ketik 0 (atau kosongkan) untuk kembali ke menu utama"
     printf "Pilih nomor aplikasi: "
