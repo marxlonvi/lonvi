@@ -1,6 +1,11 @@
 #!/data/data/com.termux/files/usr/bin/bash
 
-VERSION="1.0.8"
+# Pastikan semua binary Termux (bash, timeout, nohup, dll) tetap ketemu
+# walaupun script ini dijalankan dari shell root (su), yang PATH-nya
+# biasanya di-reset ke /system/bin dkk dan tidak include folder Termux.
+export PATH="/data/data/com.termux/files/usr/bin:$PATH"
+
+VERSION="1.0.9"
 GITHUB="https://raw.githubusercontent.com/marxlonvi/lonvi/refs/heads/main"
 
 CONFIG="$HOME/.dara"
@@ -32,8 +37,21 @@ RAM_BOOST_WHITELIST_PATTERN="^(com\.android\.|com\.google\.android\.(gms|gsf|inp
 # -> keliatan "freeze", tidak bisa input, dan output numpuk pas akhirnya
 # lepas (menu jadi berantakan). Sekarang root dicek SEKALI di awal,
 # hasilnya di-cache, dan tiap su selalu dibungkus timeout.
+#
+# ALREADY_ROOT=1 kalau script ini SENDIRI sudah dijalankan sebagai root
+# (misal lewat `su -c "bash dara.sh"`). Dalam kondisi ini kita TIDAK
+# manggil `su` lagi (nested su dari proses yang sudah UID 0 bisa hang di
+# sebagian ROM/Magisk karena tidak ada TTY buat prompt ulang) -- command
+# privileged langsung dieksekusi saja karena kita memang sudah root.
 ROOT_OK=0
+ALREADY_ROOT=0
 check_root() {
+    if [ "$(id -u 2>/dev/null)" = "0" ]; then
+        ALREADY_ROOT=1
+        ROOT_OK=1
+        return
+    fi
+
     if command -v su >/dev/null 2>&1; then
         if timeout 5 su -c 'echo ok' >/dev/null 2>&1; then
             ROOT_OK=1
@@ -45,6 +63,18 @@ check_root() {
     fi
 }
 check_root
+
+# Jalankan command privileged: langsung eval kalau proses sudah root,
+# atau lewat `su -c` (dengan timeout) kalau perlu elevate dulu.
+run_privileged() {
+    local cmd="$1"
+    local tmo="${2:-8}"
+    if [ "$ALREADY_ROOT" -eq 1 ]; then
+        eval "$cmd" >/dev/null 2>&1
+    elif [ "$ROOT_OK" -eq 1 ]; then
+        timeout "$tmo" su -c "$cmd" >/dev/null 2>&1
+    fi
+}
 
 # Status cache (update tiap poll cycle, bukan setiap display)
 LAUNCHER_ACTIVE=0
@@ -332,8 +362,8 @@ close_all_roblox() {
         am force-stop "$pkg" >/dev/null 2>&1
     done
 
-    # Root (kalau ada): SATU panggilan su untuk semua package sekaligus,
-    # dibungkus timeout supaya tidak pernah menggantung nunggu popup izin.
+    # Root (kalau ada): SATU panggilan privileged untuk semua package
+    # sekaligus (bukan loop per-package), dibungkus timeout.
     if [ "$ROOT_OK" -eq 1 ]; then
         local su_cmd=""
         for pkg in "${ALL_ROBLOX[@]}"; do
@@ -341,9 +371,8 @@ close_all_roblox() {
             pid=$(pidof "$pkg" 2>/dev/null)
             [ -n "$pid" ] && su_cmd+="kill -9 $pid 2>/dev/null; "
         done
-        timeout 8 su -c "$su_cmd" >/dev/null 2>&1
+        run_privileged "$su_cmd" 8
     fi
-
     # Sisa proses yang masih hidup tanpa root, kill langsung (best effort)
     for pkg in "${ALL_ROBLOX[@]}"; do
         pid=$(pidof "$pkg" 2>/dev/null)
@@ -465,7 +494,7 @@ clear_cache_all() {
         su_cmd+="rm -rf /data/data/$pkg/cache/* 2>/dev/null; "
     done < "$QUEUEFILE"
 
-    [ -n "$su_cmd" ] && timeout 15 su -c "$su_cmd" >/dev/null 2>&1
+    [ -n "$su_cmd" ] && run_privileged "$su_cmd" 15
 
     if command -v termux-notification >/dev/null 2>&1; then
         termux-notification --id dara_cache --title "DARA Auto Clear Cache" \
@@ -493,6 +522,8 @@ enable_cache_clear() {
     nohup bash -c "
         QUEUEFILE='$QUEUEFILE'
         ROOT_OK='$ROOT_OK'
+        ALREADY_ROOT='$ALREADY_ROOT'
+        $(declare -f run_privileged)
         $(declare -f clear_cache_all)
         $(declare -f clear_cache_loop)
         clear_cache_loop
@@ -549,7 +580,7 @@ ram_boost_once() {
     # Satu panggilan su untuk semua package, dibungkus timeout (bukan
     # loop per-package) supaya tidak pernah menggantung nunggu popup izin.
     if [ "$ROOT_OK" -eq 1 ] && [ -n "$su_cmd" ]; then
-        timeout 8 su -c "$su_cmd" >/dev/null 2>&1
+        run_privileged "$su_cmd" 8
     fi
 
     if [ "$killed" -gt 0 ] && command -v termux-notification >/dev/null 2>&1; then
@@ -581,6 +612,8 @@ enable_ram_boost() {
         QUEUEFILE='$QUEUEFILE'
         RAM_BOOST_WHITELIST_PATTERN='$RAM_BOOST_WHITELIST_PATTERN'
         ROOT_OK='$ROOT_OK'
+        ALREADY_ROOT='$ALREADY_ROOT'
+        $(declare -f run_privileged)
         $(declare -f ram_boost_once)
         $(declare -f ram_boost_loop)
         ram_boost_loop '$interval'
