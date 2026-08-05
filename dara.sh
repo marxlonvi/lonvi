@@ -5,7 +5,7 @@
 # biasanya di-reset ke /system/bin dkk dan tidak include folder Termux.
 export PATH="/data/data/com.termux/files/usr/bin:$PATH"
 
-VERSION="1.0.9"
+VERSION="1.1.1"
 GITHUB="https://raw.githubusercontent.com/marxlonvi/lonvi/refs/heads/main"
 
 CONFIG="$HOME/.dara"
