@@ -1,11 +1,11 @@
 #!/data/data/com.termux/files/usr/bin/bash
 
-VERSION="1.0.7"
+VERSION="1.1.3"
 GITHUB="https://raw.githubusercontent.com/marxlonvi/lonvi/refs/heads/main"
 
-CONFIG="$HOME/.dara"
-QUEUEFILE="$HOME/.dara_queue"
-PIDFILE="$HOME/.dara.pid"
+CONFIG="$HOME/.lana"
+QUEUEFILE="$HOME/.lana_queue"
+PIDFILE="$HOME/.lana.pid"
 
 # Warna
 R='\033[0;31m'
@@ -28,7 +28,7 @@ declare -a QUEUE_PKGS=()
     read remote
     if [ -n "$remote" ] && [ "$remote" != "$VERSION" ]; then
         tmpfile=$(mktemp)
-        curl -fsSL "$GITHUB/dara.sh" -o "$tmpfile" 2>/dev/null && \
+        curl -fsSL "$GITHUB/lana.sh" -o "$tmpfile" 2>/dev/null && \
             chmod +x "$tmpfile" 2>/dev/null && \
             mv "$tmpfile" "$0" 2>/dev/null && \
             exec "$0"
@@ -63,7 +63,7 @@ update_status_cache() {
         LAUNCHER_ACTIVE=1
     fi
     
-    if [ -f "$HOME/.dara_cache.pid" ] 2>/dev/null && kill -0 "$(cat "$HOME/.dara_cache.pid" 2>/dev/null)" 2>/dev/null; then
+    if [ -f "$HOME/.lana_cache.pid" ] 2>/dev/null && kill -0 "$(cat "$HOME/.lana_cache.pid" 2>/dev/null)" 2>/dev/null; then
         CACHE_ACTIVE=1
     fi
 }
@@ -261,7 +261,7 @@ launcher_loop() {
             local running=$(pidof "${pkgs[@]}" 2>/dev/null | wc -w)
             if [ "$running" -lt "$total" ]; then
                 if command -v termux-notification >/dev/null 2>&1; then
-                    termux-notification --id dara_launcher --title "DARA Auto-Launcher" \
+                    termux-notification --id lana_launcher --title "DARA Auto-Launcher" \
                         --content "Ada Roblox yang tertutup, menjalankan ulang antrian..." 2>/dev/null
                 fi
                 launch_sequence
@@ -356,7 +356,7 @@ stop_launcher() {
         kill "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null
         rm -f "$PIDFILE"
         if command -v termux-notification-remove >/dev/null 2>&1; then
-            termux-notification-remove dara_launcher 2>/dev/null
+            termux-notification-remove lana_launcher 2>/dev/null
         fi
         echo "Auto-Launcher Roblox dihentikan."
     else
@@ -422,7 +422,7 @@ clear_cache_all() {
     done
     
     if command -v termux-notification >/dev/null 2>&1; then
-        termux-notification --id dara_cache --title "DARA Auto Clear Cache" \
+        termux-notification --id lana_cache --title "DARA Auto Clear Cache" \
             --content "Cache semua Roblox di antrian sudah dibersihkan." 2>/dev/null
     fi
 }
@@ -438,7 +438,7 @@ clear_cache_loop() {
 }
 
 cache_clear_running() {
-    [ -f "$HOME/.dara_cache.pid" ] && kill -0 "$(cat "$HOME/.dara_cache.pid" 2>/dev/null)" 2>/dev/null
+    [ -f "$HOME/.lana_cache.pid" ] && kill -0 "$(cat "$HOME/.lana_cache.pid" 2>/dev/null)" 2>/dev/null
 }
 
 enable_cache_clear() {
@@ -450,16 +450,16 @@ enable_cache_clear() {
         $(declare -f clear_cache_loop)
         clear_cache_loop
     " >/dev/null 2>&1 &
-    echo $! > "$HOME/.dara_cache.pid"
+    echo $! > "$HOME/.lana_cache.pid"
 }
 
 disable_cache_clear() {
-    if [ -f "$HOME/.dara_cache.pid" ]; then
-        kill "$(cat "$HOME/.dara_cache.pid" 2>/dev/null)" 2>/dev/null
-        rm -f "$HOME/.dara_cache.pid"
+    if [ -f "$HOME/.lana_cache.pid" ]; then
+        kill "$(cat "$HOME/.lana_cache.pid" 2>/dev/null)" 2>/dev/null
+        rm -f "$HOME/.lana_cache.pid"
     fi
     if command -v termux-notification-remove >/dev/null 2>&1; then
-        termux-notification-remove dara_cache 2>/dev/null
+        termux-notification-remove lana_cache 2>/dev/null
     fi
 }
 
