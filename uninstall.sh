@@ -68,7 +68,6 @@ com.android.music
 com.android.provider.apt
 com.android.provider.patch
 com.android.provider.proxy
-com.android.provider.root
 com.android.provider.xmonitor
 com.android.provision
 com.android.quicksearchbox
