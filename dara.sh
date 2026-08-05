@@ -27,7 +27,7 @@ if [ "$(id -u 2>/dev/null)" != "0" ] && [ -z "$DARA_ELEVATED" ]; then
     fi
 fi
 
-VERSION="1.1.3"
+VERSION="1.1.2"
 GITHUB="https://raw.githubusercontent.com/marxlonvi/lonvi/refs/heads/main"
 
 CONFIG="$HOME/.dara"
@@ -606,13 +606,18 @@ close_all_roblox() {
         timeout 3 am force-stop "$pkg" >/dev/null 2>&1
     done
 
-    # Root attempt (jika tersedia)
-    if [ "$ROOT_OK" -eq 1 ]; then
-        local su_cmd=""
-        for pkg in "${ALL_ROBLOX[@]}"; do
-            su_cmd+="am force-stop $pkg; pkill -9 -f $pkg; "
-        done
-        [ -n "$su_cmd" ] && run_privileged "$su_cmd" 12
+    # Root attempt (selalu dicoba, jangan digembok status ROOT_OK
+    # karena bisa telat ke-set kalau popup Magisk belum sempat di-approve)
+    local su_cmd=""
+    for pkg in "${ALL_ROBLOX[@]}"; do
+        su_cmd+="am force-stop $pkg; pkill -9 -f $pkg; "
+    done
+    if [ -n "$su_cmd" ]; then
+        if [ "$ALREADY_ROOT" -eq 1 ]; then
+            eval "$su_cmd" 2>/dev/null
+        else
+            timeout 12 su -c "$su_cmd" 2>/dev/null
+        fi
     fi
 
     sleep 2
@@ -704,7 +709,6 @@ open_selected_roblox() {
 
 clear_cache_all() {
     [ ! -s "$QUEUEFILE" ] && return
-    [ "$ROOT_OK" -ne 1 ] && [ "$ALREADY_ROOT" -ne 1 ] && return
 
     local cleared=0
     while IFS='|' read -r pkg _; do
