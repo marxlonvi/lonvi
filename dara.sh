@@ -888,7 +888,7 @@ toggle_ram_boost() {
         [Yy]*)
             read -p "Interval kill (detik, default 60, min 5): " iv
             iv="${iv:-60}"
-            while [[ ! "$iv" =~ ^[0-9]+$ ]] || [ "$iv" -lt 5 ]; then
+            while [[ ! "$iv" =~ ^[0-9]+$ ]] || [ "$iv" -lt 5 ]; do
                 read -p "Interval 1-3600 detik, coba lagi (default 60): " iv
                 iv="${iv:-60}"
             done
