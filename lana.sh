@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 
-VERSION="1.1.3"
+VERSION="1.1.5"
 GITHUB="https://raw.githubusercontent.com/marxlonvi/lonvi/refs/heads/main"
 
 CONFIG="$HOME/.lana"
@@ -289,6 +289,15 @@ close_all_roblox() {
 
     echo "Menutup paksa ${#ALL_ROBLOX[@]} Roblox..."
 
+    # Tes root sekali di awal dengan timeout, supaya kalau popup izin root
+    # tidak terjawab (mis. layar terkunci), skrip tidak nge-hang selamanya.
+    HAS_ROOT=0
+    if command -v su >/dev/null 2>&1; then
+        if timeout 3 su -c "id" >/dev/null 2>&1; then
+            HAS_ROOT=1
+        fi
+    fi
+
     for pkg in "${ALL_ROBLOX[@]}"; do
         # Coba beberapa metode sekaligus supaya benar-benar mati apapun
         # kondisinya (am force-stop bisa gagal kalau ada dialog/izin aneh,
@@ -296,15 +305,15 @@ close_all_roblox() {
         am force-stop "$pkg" >/dev/null 2>&1
         am kill "$pkg" >/dev/null 2>&1
 
-        if command -v su >/dev/null 2>&1; then
-            su -c "am force-stop $pkg" >/dev/null 2>&1
+        if [ "$HAS_ROOT" -eq 1 ]; then
+            timeout 3 su -c "am force-stop $pkg" >/dev/null 2>&1
         fi
 
         pid=$(pidof "$pkg" 2>/dev/null)
         if [ -n "$pid" ]; then
             kill -9 $pid >/dev/null 2>&1
-            if command -v su >/dev/null 2>&1; then
-                su -c "kill -9 $pid" >/dev/null 2>&1
+            if [ "$HAS_ROOT" -eq 1 ]; then
+                timeout 3 su -c "kill -9 $pid" >/dev/null 2>&1
             fi
         fi
     done
@@ -418,7 +427,7 @@ clear_cache_all() {
     [ ! -s "$QUEUEFILE" ] && return
     
     cut -d'|' -f1 "$QUEUEFILE" 2>/dev/null | grep -v '^$' | while read -r pkg; do
-        su -c "rm -rf /data/data/$pkg/cache/* 2>/dev/null" >/dev/null 2>&1
+        timeout 5 su -c "rm -rf /data/data/$pkg/cache/* 2>/dev/null" >/dev/null 2>&1
     done
     
     if command -v termux-notification >/dev/null 2>&1; then
