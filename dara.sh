@@ -7,6 +7,26 @@
 
 export PATH="/data/data/com.termux/files/usr/bin:$PATH"
 
+# ─────────────────────────────────────────────────────────────────────────
+# SELF-ELEVATION KE ROOT
+# Kalau script belum jalan sebagai root, minta akses root sekali di awal
+# lalu re-exec seluruh script lewat `su`. Setelah ini SEMUA command di
+# dalam script (am, pm, rm, dll) otomatis jalan sebagai root tanpa perlu
+# wrap manual satu-satu. Kalau su tidak tersedia / user tolak akses,
+# script tetap lanjut jalan sebagai user biasa (fitur yang butuh root
+# akan otomatis nonaktif/terbatas, lihat check_root()).
+#
+# DARA_ELEVATED dipakai sebagai penanda supaya tidak infinite-loop
+# re-exec ke su berkali-kali.
+# ─────────────────────────────────────────────────────────────────────────
+if [ "$(id -u 2>/dev/null)" != "0" ] && [ -z "$DARA_ELEVATED" ]; then
+    if command -v su >/dev/null 2>&1; then
+        export DARA_ELEVATED=1
+        exec su -c "export PATH='/data/data/com.termux/files/usr/bin:\$PATH'; export DARA_ELEVATED=1; export HOME='$HOME'; export TERM='${TERM:-xterm-256color}'; bash '$0' \"\$@\"" -- "$@" 2>/dev/null \
+            || { unset DARA_ELEVATED; echo "Gagal elevate ke root, lanjut sebagai user biasa..."; sleep 1; }
+    fi
+fi
+
 VERSION="1.1.2"
 GITHUB="https://raw.githubusercontent.com/marxlonvi/lonvi/refs/heads/main"
 
