@@ -53,7 +53,7 @@ check_root() {
     fi
 
     if command -v su >/dev/null 2>&1; then
-        if timeout 5 su -c 'echo ok' >/dev/null 2>&1; then
+        if timeout 15 su -c 'echo ok' >/dev/null 2>&1; then
             ROOT_OK=1
         else
             ROOT_OK=0
@@ -355,23 +355,34 @@ close_all_roblox() {
         rm -f "$PIDFILE"
     fi
 
-    echo "Menutup paksa ${#ALL_ROBLOX[@]} Roblox..."
+    # Kalau root belum kedeteksi (misal popup izin belum ke-tap saat startup),
+    # coba cek ulang sekarang sebelum eksekusi. am force-stop ke package LAIN
+    # butuh izin sistem dan akan gagal diam-diam tanpa root.
+    if [ "$ROOT_OK" -ne 1 ] && [ "$ALREADY_ROOT" -ne 1 ]; then
+        check_root
+    fi
 
-    # Non-root: force-stop biasa per package (cepat, tidak butuh su)
+    echo "Menutup paksa ${#ALL_ROBLOX[@]} Roblox..."
+    [ "$ROOT_OK" -ne 1 ] && [ "$ALREADY_ROOT" -ne 1 ] && \
+        echo -e "${R}Peringatan: root tidak terdeteksi, force-stop ke app lain kemungkinan tidak akan berfungsi.${W}"
+
+    # Non-root: force-stop biasa per package (cepat, tidak butuh su, tapi
+    # biasanya tidak berefek ke package lain tanpa izin sistem/root)
     for pkg in "${ALL_ROBLOX[@]}"; do
         am force-stop "$pkg" >/dev/null 2>&1
     done
 
     # Root (kalau ada): SATU panggilan privileged untuk semua package
-    # sekaligus (bukan loop per-package), dibungkus timeout.
+    # sekaligus (bukan loop per-package), dibungkus timeout. pkill/kill
+    # dijalankan DI DALAM sesi su supaya bisa lihat & bunuh proses app lain
+    # (pidof dari sisi non-root sering gagal baca proses app lain di
+    # Android modern karena dibatasi SELinux/hidepid).
     if [ "$ROOT_OK" -eq 1 ]; then
         local su_cmd=""
         for pkg in "${ALL_ROBLOX[@]}"; do
-            su_cmd+="am force-stop $pkg; "
-            pid=$(pidof "$pkg" 2>/dev/null)
-            [ -n "$pid" ] && su_cmd+="kill -9 $pid 2>/dev/null; "
+            su_cmd+="am force-stop $pkg; pkill -9 -f $pkg; "
         done
-        run_privileged "$su_cmd" 8
+        run_privileged "$su_cmd" 12
     fi
     # Sisa proses yang masih hidup tanpa root, kill langsung (best effort)
     for pkg in "${ALL_ROBLOX[@]}"; do
@@ -717,6 +728,7 @@ while true; do
     # Update status cache sebelum display
     update_status_cache
     
+    echo -e "${C}Root      :${W} $([ "$ROOT_OK" -eq 1 ] && echo "${G}● TERDETEKSI${W}" || echo "${R}● TIDAK TERDETEKSI${W}")"
     echo -e "${C}Link PS   :${W} ${PSLINK:-Belum diatur}"
     echo -e "${C}Antrian   :${W} $QUEUE_COUNT Roblox terdaftar"
 
