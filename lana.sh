@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 
-VERSION="1.1.8"
+VERSION="1.1.9"
 GITHUB="https://raw.githubusercontent.com/marxlonvi/lonvi/refs/heads/main"
 
 CONFIG="$HOME/.lana"
@@ -296,15 +296,14 @@ close_all_roblox() {
         am force-stop "$pkg" >/dev/null 2>&1
         am kill "$pkg" >/dev/null 2>&1
 
-        if command -v su >/dev/null 2>&1; then
-            su -c "am force-stop $pkg" >/dev/null 2>&1
-        fi
-
+        # Cek dulu apakah masih ada proses yang jalan sebelum coba akses root,
+        # supaya tidak minta izin su kalau sebenarnya sudah mati (yang bisa
+        # bikin script macet nunggu popup izin root muncul/di-tap).
         pid=$(pidof "$pkg" 2>/dev/null)
         if [ -n "$pid" ]; then
             kill -9 $pid >/dev/null 2>&1
             if command -v su >/dev/null 2>&1; then
-                su -c "kill -9 $pid" >/dev/null 2>&1
+                timeout 5 su -c "am force-stop $pkg; kill -9 $pid" >/dev/null 2>&1
             fi
         fi
     done
@@ -418,7 +417,7 @@ clear_cache_all() {
     [ ! -s "$QUEUEFILE" ] && return
     
     cut -d'|' -f1 "$QUEUEFILE" 2>/dev/null | grep -v '^$' | while read -r pkg; do
-        su -c "rm -rf /data/data/$pkg/cache/* 2>/dev/null" >/dev/null 2>&1
+        timeout 5 su -c "rm -rf /data/data/$pkg/cache/* 2>/dev/null" >/dev/null 2>&1
     done
     
     if command -v termux-notification >/dev/null 2>&1; then
