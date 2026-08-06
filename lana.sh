@@ -1,11 +1,12 @@
 #!/data/data/com.termux/files/usr/bin/bash
 
-VERSION="1.2.0"
+VERSION="1.2.1"
 GITHUB="https://raw.githubusercontent.com/marxlonvi/lonvi/refs/heads/main"
 
 CONFIG="$HOME/.lana"
 QUEUEFILE="$HOME/.lana_queue"
 PIDFILE="$HOME/.lana.pid"
+RAM_PIDFILE="$HOME/.lana_ram.pid"
 
 # Warna
 R='\033[0;31m'
@@ -20,6 +21,7 @@ AUTO_CLEAR_CACHE="yes"
 # Status cache (update tiap poll cycle, bukan setiap display)
 LAUNCHER_ACTIVE=0
 CACHE_ACTIVE=0
+RAM_BOOSTER_ACTIVE=0
 QUEUE_COUNT=0
 declare -a QUEUE_PKGS=()
 
@@ -65,6 +67,11 @@ update_status_cache() {
     
     if [ -f "$HOME/.lana_cache.pid" ] 2>/dev/null && kill -0 "$(cat "$HOME/.lana_cache.pid" 2>/dev/null)" 2>/dev/null; then
         CACHE_ACTIVE=1
+    fi
+
+    RAM_BOOSTER_ACTIVE=0
+    if [ -f "$RAM_PIDFILE" ] 2>/dev/null && kill -0 "$(cat "$RAM_PIDFILE" 2>/dev/null)" 2>/dev/null; then
+        RAM_BOOSTER_ACTIVE=1
     fi
 }
 
@@ -376,6 +383,7 @@ start_launcher() {
     sleep 1
     if kill -0 "$new_pid" 2>/dev/null; then
         echo "Auto-Launcher Roblox dimulai di background (PID $new_pid)."
+        enable_ram_booster
     else
         rm -f "$PIDFILE"
         echo "Gagal memulai Auto-Launcher. Coba jalankan 'bash lana.sh' ulang, atau cek apakah paket 'util-linux' (untuk setsid) terpasang: pkg install util-linux"
@@ -448,14 +456,41 @@ open_selected_roblox() {
 # Cache clear dengan lazy initialization dan exponential backoff
 clear_cache_all() {
     [ ! -s "$QUEUEFILE" ] && return
-    
-    cut -d'|' -f1 "$QUEUEFILE" 2>/dev/null | grep -v '^$' | while read -r pkg; do
-        timeout 5 su -c "rm -rf /data/data/$pkg/cache/* 2>/dev/null" >/dev/null 2>&1
-    done
-    
+
+    # Tanpa root, "su" tidak akan ada / tidak akan pernah berhasil. Sebelumnya
+    # kegagalan ini didiamkan begitu saja dan tetap muncul notifikasi "sudah
+    # dibersihkan" walau sebenarnya tidak terjadi apa-apa. Sekarang dicek dan
+    # dilaporkan apa adanya.
+    if ! command -v su >/dev/null 2>&1; then
+        if command -v termux-notification >/dev/null 2>&1; then
+            termux-notification --id lana_cache --title "DARA Auto Clear Cache" \
+                --content "Gagal: akses root (su) tidak ditemukan di perangkat ini." 2>/dev/null
+        fi
+        return
+    fi
+
+    # Pakai redirection input (bukan pipe) supaya loop tetap di shell utama,
+    # karena kalau lewat pipe ("cut ... | while ..."), while-nya jalan di
+    # subshell dan variabel counter di dalamnya tidak akan terlihat lagi
+    # setelah loop selesai.
+    local cleared=0 failed=0
+    while IFS='|' read -r pkg _; do
+        [ -z "$pkg" ] && continue
+        if timeout 5 su -c "rm -rf /data/data/$pkg/cache/*" >/dev/null 2>&1; then
+            ((cleared++))
+        else
+            ((failed++))
+        fi
+    done < "$QUEUEFILE"
+
     if command -v termux-notification >/dev/null 2>&1; then
-        termux-notification --id lana_cache --title "DARA Auto Clear Cache" \
-            --content "Cache semua Roblox di antrian sudah dibersihkan." 2>/dev/null
+        if [ "$cleared" -gt 0 ]; then
+            termux-notification --id lana_cache --title "DARA Auto Clear Cache" \
+                --content "Cache $cleared Roblox di antrian sudah dibersihkan." 2>/dev/null
+        else
+            termux-notification --id lana_cache --title "DARA Auto Clear Cache" \
+                --content "Gagal membersihkan cache, cek izin root (su ditolak/timeout)." 2>/dev/null
+        fi
     fi
 }
 
@@ -498,12 +533,11 @@ get_protected_pkgs() {
     printf '%s\n' "${protected[@]}"
 }
 
-ram_booster() {
-    clear
-    echo "===== RAM BOOSTER (Force Close App Lain) ====="
-    echo "Menutup paksa aplikasi latar belakang lain, kecuali Termux,"
-    echo "Roblox yang ada di antrian, launcher, dan keyboard aktif."
-    echo
+# Inti logika RAM Booster (tanpa clear/echo interaktif) supaya bisa dipanggil
+# baik dari menu (sekali jalan, dengan output) maupun dari background loop
+# (setiap 5 menit, silent + notifikasi).
+ram_booster_run() {
+    local verbose="${1:-1}"
 
     mapfile -t protected < <(get_protected_pkgs)
 
@@ -513,8 +547,7 @@ ram_booster() {
     done)
 
     if [ ${#running[@]} -eq 0 ]; then
-        echo "Tidak ada aplikasi lain yang perlu ditutup. RAM sudah bersih."
-        sleep 2
+        [ "$verbose" -eq 1 ] && echo "Tidak ada aplikasi lain yang perlu ditutup. RAM sudah bersih."
         return
     fi
 
@@ -537,16 +570,98 @@ ram_booster() {
         fi
 
         if pidof "$pkg" >/dev/null 2>&1; then
-            echo -e "   ${Y}●${W} $pkg gagal ditutup (mungkin butuh root)"
+            [ "$verbose" -eq 1 ] && echo -e "   ${Y}●${W} $pkg gagal ditutup (mungkin butuh root)"
         else
-            echo -e "   ${G}✕${W} $pkg ditutup"
+            [ "$verbose" -eq 1 ] && echo -e "   ${G}✕${W} $pkg ditutup"
             ((closed++))
         fi
     done
 
+    if [ "$verbose" -eq 1 ]; then
+        echo
+        echo "Selesai. $closed aplikasi ditutup, $skipped dilindungi (Termux/antrian/sistem)."
+    elif command -v termux-notification >/dev/null 2>&1; then
+        termux-notification --id lana_ram --title "DARA RAM Booster" \
+            --content "$closed aplikasi ditutup, $skipped dilindungi." 2>/dev/null
+    fi
+}
+
+# Jalankan sekali secara interaktif dari menu (dengan output ke layar).
+ram_booster() {
+    clear
+    echo "===== RAM BOOSTER (Force Close App Lain) ====="
+    echo "Menutup paksa aplikasi latar belakang lain, kecuali Termux,"
+    echo "Roblox yang ada di antrian, launcher, dan keyboard aktif."
     echo
-    echo "Selesai. $closed aplikasi ditutup, $skipped dilindungi (Termux/antrian/sistem)."
+    ram_booster_run 1
     read -p "Enter..."
+}
+
+# Loop background: jalan sekali saat diaktifkan, lalu berulang tiap 5 menit.
+ram_booster_loop() {
+    ram_booster_run 0
+    while true; do
+        sleep 300
+        ram_booster_run 0
+    done
+}
+
+ram_booster_running() {
+    [ -f "$RAM_PIDFILE" ] && kill -0 "$(cat "$RAM_PIDFILE" 2>/dev/null)" 2>/dev/null
+}
+
+enable_ram_booster() {
+    ram_booster_running && return
+
+    nohup bash -c "
+        QUEUEFILE='$QUEUEFILE'
+        $(declare -f get_protected_pkgs)
+        $(declare -f ram_booster_run)
+        $(declare -f ram_booster_loop)
+        ram_booster_loop
+    " >/dev/null 2>&1 &
+    disown 2>/dev/null
+    echo $! > "$RAM_PIDFILE"
+}
+
+disable_ram_booster() {
+    if [ -f "$RAM_PIDFILE" ]; then
+        kill "$(cat "$RAM_PIDFILE" 2>/dev/null)" 2>/dev/null
+        rm -f "$RAM_PIDFILE"
+    fi
+    if command -v termux-notification-remove >/dev/null 2>&1; then
+        termux-notification-remove lana_ram 2>/dev/null
+    fi
+}
+
+# Menu toggle on/off untuk RAM Booster otomatis (jalan sekali lalu tiap 5 menit).
+toggle_ram_booster() {
+    clear
+    echo "===== RAM BOOSTER OTOMATIS ====="
+    if ram_booster_running; then
+        echo "Status saat ini: ${G}AKTIF${W} (auto tutup app tiap 5 menit)"
+        echo
+        read -p "Matikan RAM Booster otomatis? (Y/n): " ans
+        ans="${ans:-Y}"
+        case "$ans" in
+            [Yy]*)
+                disable_ram_booster
+                echo "RAM Booster otomatis dimatikan."
+                ;;
+        esac
+    else
+        echo "Status saat ini: ${R}TIDAK AKTIF${W}"
+        echo
+        read -p "Aktifkan RAM Booster otomatis? (Y/n): " ans
+        ans="${ans:-Y}"
+        case "$ans" in
+            [Yy]*)
+                enable_ram_booster
+                echo "RAM Booster otomatis diaktifkan (jalan sekarang, lalu tiap 5 menit)."
+                ;;
+        esac
+    fi
+    sleep 2
 }
 
 enable_cache_clear() {
@@ -558,6 +673,7 @@ enable_cache_clear() {
         $(declare -f clear_cache_loop)
         clear_cache_loop
     " >/dev/null 2>&1 &
+    disown 2>/dev/null
     echo $! > "$HOME/.lana_cache.pid"
 }
 
@@ -573,7 +689,14 @@ disable_cache_clear() {
 
 toggle_cache_clear() {
     [ ! -s "$QUEUEFILE" ] && echo "Antrian Roblox masih kosong." && sleep 2 && return
-    
+
+    if ! command -v su >/dev/null 2>&1; then
+        echo -e "${Y}Peringatan:${W} perangkat ini sepertinya tidak root (perintah 'su' tidak ditemukan)."
+        echo "Auto Clear Cache butuh akses root untuk menghapus cache app lain,"
+        echo "jadi fitur ini kemungkinan besar tidak akan berefek walau diaktifkan."
+        echo
+    fi
+
     read -p "Aktifkan Auto Clear Cache tiap 2 jam? (Y/n): " ans
     ans="${ans:-Y}"
     
@@ -614,7 +737,7 @@ while true; do
     echo -e "${Y}║${W} 6. Close All Roblox      ${Y}║${W}"
     echo -e "${Y}║${W} 7. Buka Roblox (Pilih)   ${Y}║${W}"
     echo -e "${Y}║${W} 8. Auto Clear Cache      ${Y}║${W}"
-    echo -e "${Y}║${W} 9. RAM Booster           ${Y}║${W}"
+    echo -e "${Y}║${W} 9. RAM Booster (On/Off)  ${Y}║${W}"
     echo -e "${Y}║${W} 0. Keluar                ${Y}║${W}"
     echo -e "${Y}╚══════════════════════════╝${W}"
     echo
@@ -638,6 +761,7 @@ while true; do
 
     echo -e "${C}Launcher   :${W} $([ "$LAUNCHER_ACTIVE" -eq 1 ] && echo "${G}● AKTIF${W}" || echo "${R}● TIDAK AKTIF${W}")"
     echo -e "${C}Clear Cache:${W} $([ "$CACHE_ACTIVE" -eq 1 ] && echo "${G}● AKTIF${W} (tiap 2 jam, root)" || echo "${R}● TIDAK AKTIF${W}")"
+    echo -e "${C}RAM Booster:${W} $([ "$RAM_BOOSTER_ACTIVE" -eq 1 ] && echo "${G}● AKTIF${W} (tiap 5 menit)" || echo "${R}● TIDAK AKTIF${W}")"
     echo
 
     read -p "Pilih: " menu
@@ -670,11 +794,12 @@ while true; do
             toggle_cache_clear
             ;;
         9)
-            ram_booster
+            toggle_ram_booster
             ;;
         0)
             stop_launcher
             disable_cache_clear
+            disable_ram_booster
             exit 0
             ;;
     esac
