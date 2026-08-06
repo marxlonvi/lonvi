@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 
-VERSION="1.1.9"
+VERSION="1.2.0"
 GITHUB="https://raw.githubusercontent.com/marxlonvi/lonvi/refs/heads/main"
 
 CONFIG="$HOME/.lana"
@@ -75,6 +75,20 @@ update_status_cache() {
 load_queue_cache
 update_status_cache
 
+# Cache daftar app Roblox terpasang (TTL 15 detik) supaya "pm list packages"
+# (yang lumayan berat di Android) tidak dipanggil berulang-ulang tiap menu.
+_ROBLOX_APPS_CACHE=()
+_ROBLOX_APPS_CACHE_TS=0
+get_roblox_apps() {
+    local now
+    now=$(date +%s 2>/dev/null || echo 0)
+    if [ ${#_ROBLOX_APPS_CACHE[@]} -eq 0 ] || [ $((now - _ROBLOX_APPS_CACHE_TS)) -ge 15 ]; then
+        mapfile -t _ROBLOX_APPS_CACHE < <(pm list packages 2>/dev/null | sed 's/package://' | grep -i roblox)
+        _ROBLOX_APPS_CACHE_TS=$now
+    fi
+    printf '%s\n' "${_ROBLOX_APPS_CACHE[@]}"
+}
+
 view_queue() {
     clear
     echo "===== DAFTAR ROBLOX (ANTRIAN LAUNCHER ROBLOX) ====="
@@ -96,7 +110,7 @@ view_queue() {
 }
 
 add_to_queue() {
-    mapfile -t APPS < <(pm list packages 2>/dev/null | sed 's/package://' | grep -i roblox)
+    mapfile -t APPS < <(get_roblox_apps)
     
     if [ ${#APPS[@]} -eq 0 ]; then
         echo "Roblox tidak ditemukan."
@@ -273,7 +287,7 @@ launcher_loop() {
 }
 
 close_all_roblox() {
-    mapfile -t ALL_ROBLOX < <(pm list packages 2>/dev/null | sed 's/package://' | grep -i roblox)
+    mapfile -t ALL_ROBLOX < <(get_roblox_apps)
 
     if [ ${#ALL_ROBLOX[@]} -eq 0 ]; then
         echo "Tidak ada Roblox terpasang di device."
@@ -330,23 +344,42 @@ close_all_roblox() {
 
 start_launcher() {
     [ ! -s "$QUEUEFILE" ] && echo "Antrian Roblox masih kosong." && sleep 2 && return
-    
-    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
-        echo "Auto-Launcher Roblox sudah berjalan."
-        sleep 2
-        return
+
+    # Bersihkan PID file basi (proses lama sudah mati / PID sudah dipakai
+    # ulang oleh proses lain) supaya tidak salah anggap "sudah berjalan".
+    if [ -f "$PIDFILE" ]; then
+        local old_pid
+        old_pid=$(cat "$PIDFILE" 2>/dev/null)
+        if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null \
+           && ps -p "$old_pid" -o args= 2>/dev/null | grep -q "launcher_loop"; then
+            echo "Auto-Launcher Roblox sudah berjalan (PID $old_pid)."
+            sleep 2
+            return
+        fi
+        rm -f "$PIDFILE"
     fi
 
-    nohup bash -c "
+    local runner="nohup"
+    command -v setsid >/dev/null 2>&1 && runner="setsid nohup"
+
+    $runner bash -c "
         QUEUEFILE='$QUEUEFILE'; PSLINK='$PSLINK'
         $(declare -f launch_package)
         $(declare -f launch_sequence)
         $(declare -f launcher_loop)
         launcher_loop
     " >/dev/null 2>&1 &
-    echo $! > "$PIDFILE"
-    
-    echo "Auto-Launcher Roblox dimulai di background."
+    disown 2>/dev/null
+    local new_pid=$!
+    echo "$new_pid" > "$PIDFILE"
+
+    sleep 1
+    if kill -0 "$new_pid" 2>/dev/null; then
+        echo "Auto-Launcher Roblox dimulai di background (PID $new_pid)."
+    else
+        rm -f "$PIDFILE"
+        echo "Gagal memulai Auto-Launcher. Coba jalankan 'bash lana.sh' ulang, atau cek apakah paket 'util-linux' (untuk setsid) terpasang: pkg install util-linux"
+    fi
     sleep 2
 }
 
@@ -369,7 +402,7 @@ stop_launcher() {
 # masuk PS link. Kalau app-nya sudah aktif/terbuka -> force-close dulu baru
 # buka ulang + masuk PS link (fresh join).
 open_selected_roblox() {
-    mapfile -t APPS < <(pm list packages 2>/dev/null | sed 's/package://' | grep -i roblox)
+    mapfile -t APPS < <(get_roblox_apps)
 
     if [ ${#APPS[@]} -eq 0 ]; then
         echo "Roblox tidak ditemukan."
@@ -440,6 +473,82 @@ cache_clear_running() {
     [ -f "$HOME/.lana_cache.pid" ] && kill -0 "$(cat "$HOME/.lana_cache.pid" 2>/dev/null)" 2>/dev/null
 }
 
+# Daftar paket yang TIDAK BOLEH ditutup oleh RAM Booster: Termux sendiri,
+# semua Roblox yang ada di antrian, home launcher, keyboard aktif, dan
+# proses inti Android. Ini yang bikin RAM booster "tidak mengganggu kinerja
+# script" -> script & Roblox yang lagi dipakai tidak ikut ke-kill.
+get_protected_pkgs() {
+    local protected=(com.termux com.termux.api com.termux.boot
+                      com.android.systemui com.android.settings
+                      android com.android.phone com.android.providers.settings)
+
+    local home_pkg
+    home_pkg=$(cmd package resolve-activity --brief -c android.intent.category.HOME 2>/dev/null \
+        | tail -n 1 | cut -d'/' -f1)
+    [ -n "$home_pkg" ] && [[ "$home_pkg" != *Error* ]] && protected+=("$home_pkg")
+
+    local ime
+    ime=$(settings get secure default_input_method 2>/dev/null | cut -d'/' -f1)
+    [ -n "$ime" ] && [ "$ime" != "null" ] && protected+=("$ime")
+
+    while IFS='|' read -r pkg _; do
+        [ -n "$pkg" ] && protected+=("$pkg")
+    done < "$QUEUEFILE"
+
+    printf '%s\n' "${protected[@]}"
+}
+
+ram_booster() {
+    clear
+    echo "===== RAM BOOSTER (Force Close App Lain) ====="
+    echo "Menutup paksa aplikasi latar belakang lain, kecuali Termux,"
+    echo "Roblox yang ada di antrian, launcher, dan keyboard aktif."
+    echo
+
+    mapfile -t protected < <(get_protected_pkgs)
+
+    # Ambil daftar proses app pihak ketiga yang sedang berjalan.
+    mapfile -t running < <(pm list packages -3 2>/dev/null | sed 's/package://' | while read -r p; do
+        pidof "$p" >/dev/null 2>&1 && echo "$p"
+    done)
+
+    if [ ${#running[@]} -eq 0 ]; then
+        echo "Tidak ada aplikasi lain yang perlu ditutup. RAM sudah bersih."
+        sleep 2
+        return
+    fi
+
+    local closed=0 skipped=0
+    for pkg in "${running[@]}"; do
+        [ -z "$pkg" ] && continue
+        local skip=0
+        for p in "${protected[@]}"; do
+            [ "$pkg" = "$p" ] && skip=1 && break
+        done
+        if [ "$skip" -eq 1 ]; then
+            ((skipped++))
+            continue
+        fi
+
+        am force-stop "$pkg" >/dev/null 2>&1
+        am kill "$pkg" >/dev/null 2>&1
+        if pidof "$pkg" >/dev/null 2>&1 && command -v su >/dev/null 2>&1; then
+            timeout 5 su -c "am force-stop $pkg" >/dev/null 2>&1
+        fi
+
+        if pidof "$pkg" >/dev/null 2>&1; then
+            echo -e "   ${Y}●${W} $pkg gagal ditutup (mungkin butuh root)"
+        else
+            echo -e "   ${G}✕${W} $pkg ditutup"
+            ((closed++))
+        fi
+    done
+
+    echo
+    echo "Selesai. $closed aplikasi ditutup, $skipped dilindungi (Termux/antrian/sistem)."
+    read -p "Enter..."
+}
+
 enable_cache_clear() {
     cache_clear_running && return
     
@@ -505,6 +614,7 @@ while true; do
     echo -e "${Y}║${W} 6. Close All Roblox      ${Y}║${W}"
     echo -e "${Y}║${W} 7. Buka Roblox (Pilih)   ${Y}║${W}"
     echo -e "${Y}║${W} 8. Auto Clear Cache      ${Y}║${W}"
+    echo -e "${Y}║${W} 9. RAM Booster           ${Y}║${W}"
     echo -e "${Y}║${W} 0. Keluar                ${Y}║${W}"
     echo -e "${Y}╚══════════════════════════╝${W}"
     echo
@@ -558,6 +668,9 @@ while true; do
             ;;
         8)
             toggle_cache_clear
+            ;;
+        9)
+            ram_booster
             ;;
         0)
             stop_launcher
