@@ -1,7 +1,17 @@
 #!/data/data/com.termux/files/usr/bin/bash
 
-VERSION="1.2.1"
+VERSION="1.2.2"
 GITHUB="https://raw.githubusercontent.com/marxlonvi/lonvi/refs/heads/main"
+
+# Resolusi path absolut untuk bash/nohup/setsid. Kalau script dijalankan
+# lewat "su" dulu baru "./lana.sh", PATH sering ke-reset dan tidak lagi
+# mengarah ke /data/data/com.termux/files/usr/bin, jadi "bash"/"nohup"/
+# "setsid" gagal ditemukan walau sebenarnya terpasang. Fallback ke path
+# default Termux kalau "command -v" gagal menemukannya di PATH saat ini.
+TERMUX_BIN="/data/data/com.termux/files/usr/bin"
+BASH_BIN="$(command -v bash 2>/dev/null || echo "$TERMUX_BIN/bash")"
+NOHUP_BIN="$(command -v nohup 2>/dev/null || echo "$TERMUX_BIN/nohup")"
+SETSID_BIN="$(command -v setsid 2>/dev/null || echo "$TERMUX_BIN/setsid")"
 
 CONFIG="$HOME/.lana"
 QUEUEFILE="$HOME/.lana_queue"
@@ -310,24 +320,34 @@ close_all_roblox() {
 
     echo "Menutup paksa ${#ALL_ROBLOX[@]} Roblox..."
 
+    # Tahap 1: coba tanpa root dulu untuk semua package.
     for pkg in "${ALL_ROBLOX[@]}"; do
-        # Coba beberapa metode sekaligus supaya benar-benar mati apapun
-        # kondisinya (am force-stop bisa gagal kalau ada dialog/izin aneh,
-        # jadi di-backup dengan su force-stop dan kill proses langsung).
         am force-stop "$pkg" >/dev/null 2>&1
         am kill "$pkg" >/dev/null 2>&1
-
-        # Cek dulu apakah masih ada proses yang jalan sebelum coba akses root,
-        # supaya tidak minta izin su kalau sebenarnya sudah mati (yang bisa
-        # bikin script macet nunggu popup izin root muncul/di-tap).
-        pid=$(pidof "$pkg" 2>/dev/null)
-        if [ -n "$pid" ]; then
-            kill -9 $pid >/dev/null 2>&1
-            if command -v su >/dev/null 2>&1; then
-                timeout 5 su -c "am force-stop $pkg; kill -9 $pid" >/dev/null 2>&1
-            fi
-        fi
     done
+    sleep 1
+
+    # Tahap 2: kumpulkan yang masih hidup, lalu mintakan root SEKALI SAJA
+    # untuk semuanya (bukan satu popup per aplikasi). Popup izin root cuma
+    # muncul sekali di sini, dengan timeout yang lebih longgar supaya
+    # sempat di-tap "Allow".
+    local still_running=()
+    for pkg in "${ALL_ROBLOX[@]}"; do
+        pid=$(pidof "$pkg" 2>/dev/null)
+        [ -n "$pid" ] && still_running+=("$pkg")
+    done
+
+    if [ ${#still_running[@]} -gt 0 ] && command -v su >/dev/null 2>&1; then
+        local su_cmds=""
+        for pkg in "${still_running[@]}"; do
+            su_cmds+="am force-stop $pkg; "
+            pid=$(pidof "$pkg" 2>/dev/null)
+            [ -n "$pid" ] && su_cmds+="kill -9 $pid; "
+        done
+        echo "Butuh izin root untuk menutup ${#still_running[@]} Roblox yang masih hidup..."
+        echo "(Kalau muncul popup izin root, tap Allow/Grant sekarang)"
+        timeout 20 su -c "$su_cmds" >/dev/null 2>&1
+    fi
 
     sleep 1
 
@@ -349,33 +369,52 @@ close_all_roblox() {
     sleep 2
 }
 
+LAUNCHER_LOGFILE="$HOME/.lana_launcher.log"
+
 start_launcher() {
     [ ! -s "$QUEUEFILE" ] && echo "Antrian Roblox masih kosong." && sleep 2 && return
 
     # Bersihkan PID file basi (proses lama sudah mati / PID sudah dipakai
     # ulang oleh proses lain) supaya tidak salah anggap "sudah berjalan".
+    # Catatan: sebagian build Android (toybox ps) tidak mendukung
+    # "ps -p PID -o args=", jadi dicek dulu dukungannya. Kalau tidak
+    # didukung, cukup andalkan kill -0 saja (masih PID yang sama-sama hidup).
     if [ -f "$PIDFILE" ]; then
         local old_pid
         old_pid=$(cat "$PIDFILE" 2>/dev/null)
-        if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null \
-           && ps -p "$old_pid" -o args= 2>/dev/null | grep -q "launcher_loop"; then
-            echo "Auto-Launcher Roblox sudah berjalan (PID $old_pid)."
-            sleep 2
-            return
+        if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
+            local args_out
+            args_out=$(ps -p "$old_pid" -o args= 2>/dev/null)
+            if [ -n "$args_out" ]; then
+                if echo "$args_out" | grep -q "launcher_loop"; then
+                    echo "Auto-Launcher Roblox sudah berjalan (PID $old_pid)."
+                    sleep 2
+                    return
+                fi
+                # ps jalan tapi bukan proses launcher_loop -> PID basi/reuse, lanjut restart.
+            else
+                # ps tidak mendukung -o args= di device ini: anggap masih jalan
+                # supaya tidak dobel-start proses yang sebenarnya masih aktif.
+                echo "Auto-Launcher Roblox kemungkinan sudah berjalan (PID $old_pid)."
+                echo "Kalau yakin belum jalan, pilih menu 5 (Stop) dulu baru menu 4 lagi."
+                sleep 3
+                return
+            fi
         fi
         rm -f "$PIDFILE"
     fi
 
-    local runner="nohup"
-    command -v setsid >/dev/null 2>&1 && runner="setsid nohup"
+    local runner="$NOHUP_BIN"
+    [ -x "$SETSID_BIN" ] && runner="$SETSID_BIN $NOHUP_BIN"
 
-    $runner bash -c "
+    : > "$LAUNCHER_LOGFILE"
+    $runner "$BASH_BIN" -c "
         QUEUEFILE='$QUEUEFILE'; PSLINK='$PSLINK'
         $(declare -f launch_package)
         $(declare -f launch_sequence)
         $(declare -f launcher_loop)
         launcher_loop
-    " >/dev/null 2>&1 &
+    " >>"$LAUNCHER_LOGFILE" 2>&1 &
     disown 2>/dev/null
     local new_pid=$!
     echo "$new_pid" > "$PIDFILE"
@@ -386,9 +425,15 @@ start_launcher() {
         enable_ram_booster
     else
         rm -f "$PIDFILE"
-        echo "Gagal memulai Auto-Launcher. Coba jalankan 'bash lana.sh' ulang, atau cek apakah paket 'util-linux' (untuk setsid) terpasang: pkg install util-linux"
+        echo "Gagal memulai Auto-Launcher."
+        if [ -s "$LAUNCHER_LOGFILE" ]; then
+            echo "Isi log error ($LAUNCHER_LOGFILE):"
+            tail -n 10 "$LAUNCHER_LOGFILE"
+        else
+            echo "Coba jalankan 'bash lana.sh' ulang, atau cek apakah paket 'util-linux' (untuk setsid) terpasang: pkg install util-linux"
+        fi
     fi
-    sleep 2
+    sleep 3
 }
 
 stop_launcher() {
@@ -513,7 +558,7 @@ cache_clear_running() {
 # proses inti Android. Ini yang bikin RAM booster "tidak mengganggu kinerja
 # script" -> script & Roblox yang lagi dipakai tidak ikut ke-kill.
 get_protected_pkgs() {
-    local protected=(com.termux com.termux.api com.termux.boot
+    local protected=(com.termux com.termux.api com.termux.window com.termux.boot
                       com.android.systemui com.android.settings
                       android com.android.phone com.android.providers.settings)
 
@@ -552,6 +597,7 @@ ram_booster_run() {
     fi
 
     local closed=0 skipped=0
+    local -a to_recheck=()
     for pkg in "${running[@]}"; do
         [ -z "$pkg" ] && continue
         local skip=0
@@ -565,9 +611,26 @@ ram_booster_run() {
 
         am force-stop "$pkg" >/dev/null 2>&1
         am kill "$pkg" >/dev/null 2>&1
-        if pidof "$pkg" >/dev/null 2>&1 && command -v su >/dev/null 2>&1; then
-            timeout 5 su -c "am force-stop $pkg" >/dev/null 2>&1
-        fi
+        pidof "$pkg" >/dev/null 2>&1 && to_recheck+=("$pkg")
+    done
+
+    # Root fallback dibatch jadi SATU permintaan su, bukan satu per app,
+    # supaya cuma sekali muncul popup izin (dan tidak keburu timeout).
+    if [ ${#to_recheck[@]} -gt 0 ] && command -v su >/dev/null 2>&1; then
+        local su_cmds=""
+        for pkg in "${to_recheck[@]}"; do
+            su_cmds+="am force-stop $pkg; "
+        done
+        timeout 20 su -c "$su_cmds" >/dev/null 2>&1
+    fi
+
+    for pkg in "${running[@]}"; do
+        [ -z "$pkg" ] && continue
+        local skip=0
+        for p in "${protected[@]}"; do
+            [ "$pkg" = "$p" ] && skip=1 && break
+        done
+        [ "$skip" -eq 1 ] && continue
 
         if pidof "$pkg" >/dev/null 2>&1; then
             [ "$verbose" -eq 1 ] && echo -e "   ${Y}●${W} $pkg gagal ditutup (mungkin butuh root)"
@@ -613,7 +676,7 @@ ram_booster_running() {
 enable_ram_booster() {
     ram_booster_running && return
 
-    nohup bash -c "
+    "$NOHUP_BIN" "$BASH_BIN" -c "
         QUEUEFILE='$QUEUEFILE'
         $(declare -f get_protected_pkgs)
         $(declare -f ram_booster_run)
@@ -667,7 +730,7 @@ toggle_ram_booster() {
 enable_cache_clear() {
     cache_clear_running && return
     
-    nohup bash -c "
+    "$NOHUP_BIN" "$BASH_BIN" -c "
         QUEUEFILE='$QUEUEFILE'
         $(declare -f clear_cache_all)
         $(declare -f clear_cache_loop)
