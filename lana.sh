@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 
-VERSION="1.2.2"
+VERSION="1.2.3"
 GITHUB="https://raw.githubusercontent.com/marxlonvi/lonvi/refs/heads/main"
 
 # Resolusi path absolut untuk bash/nohup/setsid. Kalau script dijalankan
@@ -142,10 +142,12 @@ add_to_queue() {
         echo "$((++i)). $app"
     done
     echo
-    read -p "Pilih nomor (bisa lebih dari satu, pisahkan spasi, misal: 1 2 3 4): " pilih_input
+    read -p "Pilih nomor (bisa lebih dari satu, pisahkan koma, misal: 1,2,3,4): " pilih_input
 
     declare -a chosen=()
-    for p in $pilih_input; do
+    IFS=',' read -ra _pilih_arr <<< "$pilih_input"
+    for p in "${_pilih_arr[@]}"; do
+        p="$(echo "$p" | tr -d '[:space:]')"
         if [[ "$p" =~ ^[0-9]+$ ]] && [ "$p" -ge 1 ] && [ "$p" -le "${#APPS[@]}" ]; then
             local dup=0
             for c in "${chosen[@]}"; do
@@ -184,7 +186,7 @@ remove_from_queue() {
     
     [ "$QUEUE_COUNT" -eq 0 ] && read -p "Enter..." && return
     
-    read -p "Hapus nomor berapa? (pisahkan spasi utk banyak, 'all' utk semua, 0 batal): " pilih_input
+    read -p "Hapus nomor berapa? (pisahkan koma utk banyak, misal 1,2,3, 'all' utk semua, 0 batal): " pilih_input
 
     if [ "$pilih_input" = "0" ]; then
         echo "Dibatalkan."
@@ -201,7 +203,9 @@ remove_from_queue() {
     fi
 
     declare -a nums=()
-    for p in $pilih_input; do
+    IFS=',' read -ra _pilih_arr <<< "$pilih_input"
+    for p in "${_pilih_arr[@]}"; do
+        p="$(echo "$p" | tr -d '[:space:]')"
         if [[ "$p" =~ ^[0-9]+$ ]] && [ "$p" -ge 1 ] && [ "$p" -le "$QUEUE_COUNT" ]; then
             local dup=0
             for c in "${nums[@]}"; do
@@ -455,47 +459,73 @@ stop_launcher() {
 # masuk PS link. Kalau app-nya sudah aktif/terbuka -> force-close dulu baru
 # buka ulang + masuk PS link (fresh join).
 open_selected_roblox() {
-    mapfile -t APPS < <(get_roblox_apps)
+    while true; do
+        mapfile -t APPS < <(get_roblox_apps)
 
-    if [ ${#APPS[@]} -eq 0 ]; then
-        echo "Roblox tidak ditemukan."
-        read -p "Enter..."
-        return
-    fi
-
-    clear
-    echo "===== BUKA ROBLOX ====="
-    local i=0
-    for app in "${APPS[@]}"; do
-        ((i++))
-        if pidof "$app" >/dev/null 2>&1; then
-            echo -e "$i. ${G}●${W} $app"
-        else
-            echo -e "$i. ${R}●${W} $app"
+        if [ ${#APPS[@]} -eq 0 ]; then
+            echo "Roblox tidak ditemukan."
+            read -p "Enter..."
+            return
         fi
-    done
-    echo
-    read -p "Pilih Roblox: " pilih
 
-    if [[ ! "$pilih" =~ ^[0-9]+$ ]] || [ "$pilih" -lt 1 ] || [ "$pilih" -gt "${#APPS[@]}" ]; then
-        echo "Pilihan tidak valid."
+        clear
+        echo "===== BUKA ROBLOX ====="
+        local i=0
+        for app in "${APPS[@]}"; do
+            ((i++))
+            if pidof "$app" >/dev/null 2>&1; then
+                echo -e "$i. ${G}●${W} $app"
+            else
+                echo -e "$i. ${R}●${W} $app"
+            fi
+        done
+        echo
+        echo "0. Kembali"
+        echo
+        read -p "Pilih Roblox (bisa lebih dari satu, pisahkan koma, misal: 1,2,3): " pilih_input
+
+        if [ "$pilih_input" = "0" ]; then
+            return
+        fi
+
+        declare -a chosen=()
+        IFS=',' read -ra _pilih_arr <<< "$pilih_input"
+        for p in "${_pilih_arr[@]}"; do
+            p="$(echo "$p" | tr -d '[:space:]')"
+            if [[ "$p" =~ ^[0-9]+$ ]] && [ "$p" -ge 1 ] && [ "$p" -le "${#APPS[@]}" ]; then
+                local dup=0
+                for c in "${chosen[@]}"; do
+                    [ "$c" = "$p" ] && dup=1 && break
+                done
+                [ "$dup" -eq 0 ] && chosen+=("$p")
+            fi
+        done
+
+        if [ ${#chosen[@]} -eq 0 ]; then
+            echo "Pilihan tidak valid."
+            read -p "Enter..."
+            continue
+        fi
+
+        echo
+        for p in "${chosen[@]}"; do
+            local pkg="${APPS[$((p-1))]}"
+
+            if pidof "$pkg" >/dev/null 2>&1; then
+                echo "$pkg sedang aktif, menutup dulu lalu membuka ulang..."
+                am force-stop "$pkg" >/dev/null 2>&1
+                sleep 1
+            else
+                echo "$pkg masih tertutup, membuka..."
+            fi
+
+            launch_package "$pkg"
+            echo "Selesai: $pkg dibuka."
+            echo
+        done
+
         read -p "Enter..."
-        return
-    fi
-
-    local pkg="${APPS[$((pilih-1))]}"
-
-    if pidof "$pkg" >/dev/null 2>&1; then
-        echo "$pkg sedang aktif, menutup dulu lalu membuka ulang..."
-        am force-stop "$pkg" >/dev/null 2>&1
-        sleep 1
-    else
-        echo "$pkg masih tertutup, membuka..."
-    fi
-
-    launch_package "$pkg"
-    echo "Selesai: $pkg dibuka."
-    read -p "Enter..."
+    done
 }
 
 # Cache clear dengan lazy initialization dan exponential backoff
