@@ -1,27 +1,13 @@
 #!/system/bin/sh
 # ============================================================
-# grid_split.sh
+# grid_split.sh (fixed)
 # Auto setup grid split-window (freeform) untuk N instance app
-# Support Android 10 (freeform experimental) & Android 12+
-# Sistem INTERAKTIF: minta input jumlah split, bisa diulang.
-#
-# CATATAN PENTING:
-# 1. Butuh akses ADB shell (dijalankan via `adb shell` dari PC,
-#    atau Termux dengan adb over wifi ke device sendiri).
-# 2. Freeform window cuma mengatur POSISI/UKURAN window, bukan
-#    membuat banyak instance dari 1 APK yang sama. Karena kamu
-#    sudah punya clone package (com.roblox.clienu s/d clienz),
-#    script ini akan pakai clone-clone itu, satu package per grid.
-# 3. Jalankan: sh grid_split.sh
-#    Lalu ikuti prompt untuk memasukkan jumlah split.
+# Versi ini VERBOSE (nampilin semua output) + retry logic buat
+# nyari TASK_ID, biar ketauan persis gagal di step mana.
 # ============================================================
 
 set -e
 
-# ------------------------------------------------------------
-# Daftar package clone yang sudah kamu siapkan.
-# Kalau clone kamu beda jumlah/pola, edit BASE_PKG & SUFFIXES.
-# ------------------------------------------------------------
 BASE_PKG="com.roblox.clien"
 SUFFIXES="u v w x y z"
 MAX_AVAILABLE=$(echo $SUFFIXES | wc -w)
@@ -45,13 +31,45 @@ setup_android_freeform() {
 }
 
 calc_grid() {
+  # Horizontal only: selalu 1 baris, N kolom sejajar ke samping.
   n=$1
-  cols=1
-  while [ $((cols * cols)) -lt "$n" ]; do
-    cols=$((cols + 1))
-  done
-  rows=$(( (n + cols - 1) / cols ))
+  rows=1
+  cols=$n
   echo "$rows $cols"
+}
+
+# Cari TASK_ID dengan retry, dan cover beberapa format dumpsys
+# (lama & baru). Print baris mentah yang match biar bisa diperiksa.
+find_task_id() {
+  pkg="$1"
+  tries=0
+  max_tries=6
+  while [ "$tries" -lt "$max_tries" ]; do
+    RAW=$(dumpsys activity activities 2>/dev/null)
+
+    # Format lama: TaskRecord{... #123 ...visible=true topActivity=ComponentInfo{pkg/...}}
+    TID=$(echo "$RAW" | grep "TaskRecord{.*$pkg" | head -1 | sed -E 's/.*#([0-9]+).*/\1/')
+
+    # Format taskId=NUM di baris/blok dekat package
+    if [ -z "$TID" ]; then
+      TID=$(echo "$RAW" | grep -A2 "$pkg" | grep "taskId=" | head -1 | sed -E 's/.*taskId=([0-9]+).*/\1/')
+    fi
+
+    # Format baru (Android 12+): "Task{... #123 ... A=uid:pkg}" atau "* Task{... #123 ...}"
+    if [ -z "$TID" ]; then
+      TID=$(echo "$RAW" | grep -E "Task\{.*#[0-9]+.*$pkg" | head -1 | sed -E 's/.*#([0-9]+).*/\1/')
+    fi
+
+    if [ -n "$TID" ]; then
+      echo "$TID"
+      return 0
+    fi
+
+    tries=$((tries + 1))
+    sleep 1
+  done
+  echo ""
+  return 1
 }
 
 run_grid_split() {
@@ -71,7 +89,15 @@ run_grid_split() {
   CELL_W=$((SCREEN_W / COLS))
   CELL_H=$((SCREEN_H / ROWS))
 
-  set -- $targets  # positional params $1..$n_split sekarang isi package list
+  set -- $targets
+
+  echo ""
+  echo "== Bersihkan instance lama dari package target (biar ga numpuk sisa window) =="
+  for pkg in $targets; do
+    echo "-> force-stop $pkg"
+    am force-stop "$pkg" 2>/dev/null || true
+  done
+  sleep 1
 
   idx=0
   for r in $(seq 0 $((ROWS - 1))); do
@@ -85,49 +111,53 @@ run_grid_split() {
       TOP=$((r * CELL_H))
       RIGHT=$((LEFT + CELL_W))
       BOTTOM=$((TOP + CELL_H))
+      # Kolom terakhir & baris terakhir dipaksa nyentuh tepi layar,
+      # biar sisa pembulatan (SCREEN_W % COLS) gak nyisain strip kosong.
+      [ "$c" -eq $((COLS - 1)) ] && RIGHT=$SCREEN_W
+      [ "$r" -eq $((ROWS - 1)) ] && BOTTOM=$SCREEN_H
 
-      echo "-> Launch $CUR_PKG (instance $idx1/$n_split) di posisi (${LEFT},${TOP})-(${RIGHT},${BOTTOM})"
+      echo ""
+      echo "-> [$idx1/$n_split] Cek resizeability $CUR_PKG"
+      RESIZEABLE=$(dumpsys package "$CUR_PKG" 2>/dev/null | grep -i "resizeableActivity" | head -1)
+      echo "   $RESIZEABLE"
+
+      echo "-> Launch $CUR_PKG target posisi (${LEFT},${TOP})-(${RIGHT},${BOTTOM})"
 
       MAIN_ACTIVITY=$(cmd package resolve-activity --brief "$CUR_PKG" 2>/dev/null | tail -1)
 
       if [ -n "$MAIN_ACTIVITY" ] && [ "$MAIN_ACTIVITY" != "No activity found" ]; then
-        am start --windowingMode 5 -n "$MAIN_ACTIVITY" >/dev/null 2>&1
+        echo "   Launching via activity: $MAIN_ACTIVITY"
+        am start --windowingMode 5 -n "$MAIN_ACTIVITY"
       else
         echo "   (main activity tidak ketemu, coba start lewat package langsung)"
-        am start --windowingMode 5 "$CUR_PKG" >/dev/null 2>&1
+        am start --windowingMode 5 "$CUR_PKG"
       fi
 
-      sleep 1.5
-
-      # Format dumpsys berbeda-beda per device/versi Android:
-      # ada yang pakai "taskId=NUM", ada yang pakai "TaskRecord{... #NUM ...}"
-      TASK_ID=$(dumpsys activity activities | grep "TaskRecord{.*$CUR_PKG" | head -1 | sed -E 's/.*#([0-9]+).*/\1/')
-      if [ -z "$TASK_ID" ]; then
-        TASK_ID=$(dumpsys activity activities | grep -A2 "$CUR_PKG" | grep "taskId=" | head -1 | sed -E 's/.*taskId=([0-9]+).*/\1/')
-      fi
+      echo "   Menunggu task terbentuk..."
+      TASK_ID=$(find_task_id "$CUR_PKG")
 
       if [ -n "$TASK_ID" ]; then
-        am task resize "$TASK_ID" "$LEFT" "$TOP" "$RIGHT" "$BOTTOM" 2>/dev/null || \
-          echo "   (gagal resize taskId $TASK_ID, mungkin app tidak resizable)"
+        echo "   TaskId ditemukan: $TASK_ID -> resize"
+        am task resize "$TASK_ID" "$LEFT" "$TOP" "$RIGHT" "$BOTTOM"
+        sleep 0.5
+        BOUNDS_CHECK=$(dumpsys activity activities 2>/dev/null | grep -A1 "#$TASK_ID " | grep -i "bounds=")
+        echo "   Bounds sekarang: $BOUNDS_CHECK"
       else
-        echo "   (taskId tidak ketemu untuk $CUR_PKG, lewati resize)"
+        echo "   !! TaskId TIDAK ketemu untuk $CUR_PKG setelah beberapa percobaan."
+        echo "   !! Kemungkinan: app belum kebuka sempurna, atau format dumpsys beda lagi."
+        echo "   !! Coba jalankan manual: dumpsys activity activities | grep -B2 -A5 \"$CUR_PKG\""
       fi
 
       idx=$((idx + 1))
     done
   done
 
-  echo "== Selesai. $idx window sudah di-setup dalam grid ${ROWS}x${COLS} =="
+  echo ""
+  echo "== Selesai. $idx window sudah diproses dalam grid ${ROWS}x${COLS} =="
 }
 
-# ------------------------------------------------------------
-# Setup freeform sekali di awal (cukup 1x per sesi ADB)
-# ------------------------------------------------------------
 setup_android_freeform
 
-# ------------------------------------------------------------
-# Loop input interaktif: minta jumlah split berulang kali
-# ------------------------------------------------------------
 while true; do
   echo ""
   echo "=== Grid Split Setup ==="
