@@ -99,7 +99,12 @@ run_grid_split() {
 
       sleep 1.5
 
-      TASK_ID=$(dumpsys activity activities | grep -A2 "$CUR_PKG" | grep "taskId=" | head -1 | sed -E 's/.*taskId=([0-9]+).*/\1/')
+      # Format dumpsys berbeda-beda per device/versi Android:
+      # ada yang pakai "taskId=NUM", ada yang pakai "TaskRecord{... #NUM ...}"
+      TASK_ID=$(dumpsys activity activities | grep "TaskRecord{.*$CUR_PKG" | head -1 | sed -E 's/.*#([0-9]+).*/\1/')
+      if [ -z "$TASK_ID" ]; then
+        TASK_ID=$(dumpsys activity activities | grep -A2 "$CUR_PKG" | grep "taskId=" | head -1 | sed -E 's/.*taskId=([0-9]+).*/\1/')
+      fi
 
       if [ -n "$TASK_ID" ]; then
         am task resize "$TASK_ID" "$LEFT" "$TOP" "$RIGHT" "$BOTTOM" 2>/dev/null || \
